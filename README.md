@@ -1,6 +1,6 @@
 # Drusdenx
 
-A high-performance, full-text search engine and database written in Rust.
+A high-performance, embedded full-text search engine and database written in Rust.
 
 ## 📚 Overview
 
@@ -146,14 +146,20 @@ Performance benchmarks using Criterion.rs on a standard Linux system:
 
 ### Search Performance
 
-| Query Type | Throughput | Latency |
-|------------|------------|---------|
-| Simple Term | **24.4M queries/sec** | 40.9 ns |
-| Boolean AND | **25.7M queries/sec** | 38.9 ns |
-| Boolean OR | **29.8M queries/sec** | 33.5 ns |
-| Complex Boolean | **24.6M queries/sec** | 40.7 ns |
-| Prefix Search | **28.7M queries/sec** | 34.9 ns |
-| Field-Specific | **30.2M queries/sec** | 33.1 ns |
+| Query Type | Throughput | Latency | Example Query |
+|------------|------------|---------|---------------|
+| Simple Term | **30.8M queries/sec** | 32.5 ns | `"fox"` |
+| Boolean AND | **26.7M queries/sec** | 37.5 ns | `"quick AND brown"` |
+| Boolean OR | **24.0M queries/sec** | 41.6 ns | `"fox OR dog"` |
+| Complex Boolean | **24.8M queries/sec** | 40.4 ns | `"(A AND B) OR (C AND D)"` |
+| Prefix Search | **28.6M queries/sec** | 34.9 ns | `"title:Doc*"` |
+| Field-Specific | **30.3M queries/sec** | 33.0 ns | `"category:category_5"` |
+| Wildcard Search | **28.4M queries/sec** | 35.2 ns | `"title:Doc*ment*"` |
+| Range Query | **28.4M queries/sec** | 35.2 ns | `"score:[25.0 TO 75.0]"` |
+| Phrase (Exact) | **29.1M queries/sec** | 34.4 ns | `"\"quick brown fox\""` |
+| Phrase (Common) | **28.5M queries/sec** | 35.1 ns | `"\"the quick\""` |
+| Fuzzy (Distance 1) | **30.1M queries/sec** | 33.2 ns | `"quik~1"` → matches "quick" |
+| Fuzzy (Distance 2) | **28.9M queries/sec** | 34.7 ns | `"brwn~2"` → matches "brown" |
 
 ### SIMD Operations (10K elements)
 
@@ -173,9 +179,6 @@ cargo bench --bench database_benchmark
 
 # Run specific benchmark group
 cargo bench --bench database_benchmark -- search
-
-# View results
-./display_database_benchmark.sh
 ```
 
 Detailed benchmark reports are available in:

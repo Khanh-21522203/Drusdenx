@@ -146,6 +146,48 @@ fn bench_search(c: &mut Criterion) {
         });
     });
     
+    // Wildcard search - find documents with any title starting with "Doc" and ending with number
+    group.bench_function("wildcard_search", |b| {
+        b.iter(|| {
+            let _ = db.search(black_box("title:Doc*ment*")).unwrap_or_default();
+        });
+    });
+    
+    // Fuzzy search - find similar words with edit distance 1
+    group.bench_function("fuzzy_search_distance_1", |b| {
+        b.iter(|| {
+            let _ = db.search(black_box("content:quik~1")).unwrap_or_default(); // Should match "quick"
+        });
+    });
+    
+    // Fuzzy search - find similar words with edit distance 2  
+    group.bench_function("fuzzy_search_distance_2", |b| {
+        b.iter(|| {
+            let _ = db.search(black_box("content:brwn~2")).unwrap_or_default(); // Should match "brown"
+        });
+    });
+    
+    // Range query - find documents with score between 25 and 75
+    group.bench_function("range_query_numeric", |b| {
+        b.iter(|| {
+            let _ = db.search(black_box("score:[25.0 TO 75.0]")).unwrap_or_default();
+        });
+    });
+    
+    // Phrase query - find exact phrase "quick brown fox"
+    group.bench_function("phrase_query_exact", |b| {
+        b.iter(|| {
+            let _ = db.search(black_box("content:\"quick brown fox\"")).unwrap_or_default();
+        });
+    });
+    
+    // Phrase query with common words - "the quick"
+    group.bench_function("phrase_query_common", |b| {
+        b.iter(|| {
+            let _ = db.search(black_box("content:\"the quick\"")).unwrap_or_default();
+        });
+    });
+    
     group.finish();
 }
 
