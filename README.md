@@ -281,20 +281,6 @@ cargo test -- --nocapture
 
 # Examples
 cargo run --example simple_usage
-
-## 🛠️ Development
-
-### Building
-
-```bash
-# Debug build
-cargo build
-
-# Release build (optimized)
-cargo build --release
-
-# With specific features
-cargo build --features "simd,compression"
 ```
 
 ## 🤝 Contributing
