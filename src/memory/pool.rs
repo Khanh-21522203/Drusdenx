@@ -20,6 +20,10 @@ pub struct Block {
     pub in_use: AtomicBool,
 }
 
+// Mark MemoryPool as Send + Sync since we're using atomic operations for thread safety
+unsafe impl Send for MemoryPool {}
+unsafe impl Sync for MemoryPool {}
+
 impl MemoryPool {
     pub fn allocate(&mut self, size: usize) -> Option<*mut u8> {
         // Find free block
@@ -66,6 +70,19 @@ impl MemoryPool {
     }
 }
 
+impl Drop for MemoryPool {
+    fn drop(&mut self) {
+        for block in &self.blocks {
+            unsafe {
+                std::alloc::dealloc(
+                    block.ptr,
+                    std::alloc::Layout::from_size_align_unchecked(block.size, 8)
+                );
+            }
+        }
+    }
+}
+
 /// Memory usage tracker
 pub struct MemoryTracker {
     pub usage: AtomicUsize,
@@ -84,7 +101,7 @@ impl MemoryTracker {
         let new_usage = self.usage.fetch_add(size, Ordering::SeqCst) + size;
         if new_usage > self.limit {
             self.usage.fetch_sub(size, Ordering::SeqCst);
-            return Err(Error::new(ErrorKind::OutOfMemory, "Memory limit exceeded".parse().unwrap()));
+            return Err(Error::new(ErrorKind::OutOfMemory, "Memory limit exceeded".to_string()));
         }
         Ok(())
     }

@@ -1,4 +1,4 @@
-use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
+use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 use std::collections::BTreeMap;
 use crate::core::error::Result;
 

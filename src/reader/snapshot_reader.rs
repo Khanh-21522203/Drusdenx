@@ -41,7 +41,7 @@ impl SnapshotReader {
 
         // Search each segment using M05's extension trait
         for reader in &self.segment_readers {
-            let mut segment = reader.write();
+            let segment = reader.write();
             let segment_results = segment.search(query, &matcher)?;
             results.extend(segment_results);
         }
@@ -62,7 +62,7 @@ impl SnapshotReader {
 
         // Search in segments
         for reader in &self.segment_readers {
-            let mut segment = reader.write();
+            let segment = reader.write();
             if let Some(doc) = segment.get_document(doc_id)? {
                 return Ok(Some(doc));
             }

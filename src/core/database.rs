@@ -1,34 +1,54 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, Instant};
 use parking_lot::RwLock;
+use crate::analysis::analyzer::{Analyzer, AnalyzerRegistry};
 use crate::core::config::Config;
-use crate::core::types::{Document};
+use crate::core::stats::{DatabaseStats, MemoryStats, BufferStats, HealthStatus, HealthCheckResult, HealthCheck};
+use crate::core::types::{Document, DocId};
 use crate::core::error::Result;
 use crate::index::inverted::{InvertedIndex};
+use crate::memory::buffer_pool::BufferPool;
 use crate::memory::pool::MemoryPool;
 use crate::mvcc::controller::MVCCController;
+use crate::parallel::indexer::ParallelIndexer;
+use crate::query::cache::QueryCache;
 use crate::query::parser::QueryParser;
 use crate::reader::reader_pool::ReaderPool;
+use crate::search::executor::{QueryExecutor, ExecutionConfig};
 use crate::schema::schema::SchemaWithAnalyzer;
-use crate::search::results::{ScoredDocument};
+use crate::search::results::{ScoredDocument, SearchResults};
 use crate::storage::layout::StorageLayout;
 use crate::storage::segment::SegmentId;
 use crate::storage::segment_writer::SegmentWriter;
-use crate::storage::wal::{WAL};
+use crate::storage::wal::{WAL, Operation};
 use crate::writer::index_writer::{IndexWriter, WriterConfig};
+use crate::core::transaction::{TransactionManager, Transaction};
 
 pub struct Database {
-    config: Config,
+    pub(crate) config: Config,
 
-    storage: Arc<StorageLayout>,
+    pub(crate) storage: Arc<StorageLayout>,
 
-    schema: SchemaWithAnalyzer,
+    pub(crate) schema: SchemaWithAnalyzer,
 
-    query_parser: QueryParser,
+    pub(crate) query_parser: QueryParser,
+    pub(crate) query_executor: Arc<QueryExecutor>,  // NEW: Stateless query execution service
+    pub(crate) query_cache: Arc<QueryCache>,        // NEW: Query result cache
 
-    mvcc: Arc<MVCCController>,
-    writer: Arc<RwLock<IndexWriter>>, // index + documents + wal
-    reader_pool: Arc<ReaderPool>,  // scorer + query_executor
+    pub(crate) mvcc: Arc<MVCCController>,
+    pub(crate) writer: Arc<RwLock<IndexWriter>>, // index + documents + wal
+    pub(crate) reader_pool: Arc<ReaderPool>,  // scorer + query_executor
+    
+    // Monitoring and metrics
+    start_time: Instant,
+    query_count: AtomicU64,
+    write_count: AtomicU64,
+    last_flush_time: Arc<RwLock<Option<SystemTime>>>,
+    last_commit_time: Arc<RwLock<Option<SystemTime>>>,
+    
+    // Transaction support
+    pub(crate) transaction_manager: Option<Arc<TransactionManager>>,
 }
 
 impl Database {
@@ -38,20 +58,41 @@ impl Database {
     ) -> Result<Self> {
         let storage = Arc::new(StorageLayout::new(config.storage_path.clone())?);
 
-        // ✅ NEW M06: Initialize MVCC
+        // Initialize MVCC
         let mvcc = Arc::new(MVCCController::new());
-
-        // ✅ Initialize InvertedIndex (needed by ReaderPool for query matching)
         let index = Arc::new(InvertedIndex::new());
 
-        // ✅ Create IndexWriter (handles segment-based writes)
+        // Create IndexWriter (handles segment-based writes)
         let wal = WAL::open(&storage, 0)?;
-        let segment_writer = SegmentWriter::new(&storage, SegmentId::new())?;
+        let buffer_pool = Arc::new(BufferPool::new(
+            config.buffer_pool_size.unwrap_or(100 * 1024 * 1024)  // Default 100MB
+        ));
+
+        // Create ParallelIndexer for concurrent document processing
+        let parallel_indexer = Arc::new(ParallelIndexer::new(
+            config.indexing_threads.unwrap_or_else(|| num_cpus::get())
+        ));
+        let segment_writer = SegmentWriter::new(
+            &storage,
+            SegmentId::new(),
+            buffer_pool.clone()
+        )?;
 
         // Calculate memory pool blocks from config.memory_limit
         let block_size = 4 * 1024 * 1024;  // 4MB per block
         let num_blocks = config.memory_limit / block_size;
         let memory_pool = MemoryPool::new(num_blocks, block_size);
+
+        let analyzer_registry = Arc::new(AnalyzerRegistry::new());
+
+        // Get Analyzer from registry using schema.default_analyzer
+        let analyzer = analyzer_registry
+            .get(&schema.default_analyzer)
+            .unwrap_or_else(|| {
+                // Fallback to standard analyzer if not found
+                Arc::new(Analyzer::standard_english())
+            });
+
 
         let writer = Arc::new(RwLock::new(IndexWriter {
             segment_writer,
@@ -65,9 +106,17 @@ impl Database {
             mvcc: mvcc.clone(),
             lock: Arc::new(Mutex::new(())),
             storage: storage.clone(),
+            buffer_pool: buffer_pool.clone(),
+            parallel_indexer: parallel_indexer.clone(),
+            analyzer,
+            merge_policy: Box::new(crate::storage::merge_policy::TieredMergePolicy::default()),
         }));
 
-        // ✅ Create reader pool (provides lock-free snapshot-based reads)
+        // Create shared QueryCache
+        let cache_entries = config.cache_size / 1024; // Approximate entry count (1KB per result)
+        let query_cache = Arc::new(QueryCache::new(cache_entries));
+
+        // Create reader pool (provides lock-free snapshot-based reads)
         let reader_pool = Arc::new(ReaderPool::new(
             mvcc.clone(),
             storage.clone(),
@@ -76,31 +125,105 @@ impl Database {
         ));
 
         let query_parser = QueryParser::new();
+        
+        // Create stateless query executor
+        let query_executor = Arc::new(QueryExecutor::new());
 
-        Ok(Self {
+        let db = Self {
             writer,
             mvcc,
             reader_pool,
             query_parser,
+            query_executor,
+            query_cache,
             storage,
             schema,  // No Arc, SchemaWithAnalyzer is Clone
             config,
-        })
+            start_time: Instant::now(),
+            query_count: AtomicU64::new(0),
+            write_count: AtomicU64::new(0),
+            last_flush_time: Arc::new(RwLock::new(None)),
+            last_commit_time: Arc::new(RwLock::new(None)),
+            transaction_manager: None, // Will be set after database is created
+        };
+        
+        Ok(db)
     }
 
     pub fn add_document(&self, doc: Document) -> Result<()> {
+        self.write_count.fetch_add(1, Ordering::Relaxed);
         self.writer.write().add_document(doc)
+    }
+    
+    /// Delete a document by ID (soft delete - marks as deleted)
+    pub fn delete_document(&self, doc_id: DocId) -> Result<()> {
+        self.write_count.fetch_add(1, Ordering::Relaxed);
+        self.writer.write().delete_document(doc_id)
+    }
+    
+    /// Delete documents matching a query
+    pub fn delete_by_query(&self, query_str: &str) -> Result<usize> {
+        // Parse query
+        let query = self.query_parser.parse(query_str)?;
+        
+        // Get reader to find matching documents
+        let reader = self.reader_pool.get_reader()?;
+        
+        // Search for documents to delete
+        let results = reader.search(&query)?;
+        let mut deleted_count = 0;
+        
+        // Delete each matching document
+        for doc in results.hits {
+            self.delete_document(doc.doc_id)?;
+            deleted_count += 1;
+        }
+        
+        Ok(deleted_count)
+    }
+    
+    /// Compact the index to physically remove deleted documents
+    /// This creates new segments without deleted documents
+    pub fn compact(&self) -> Result<()> {
+        self.writer.write().compact()
     }
 
     pub fn search(&self, query_str: &str) -> Result<Vec<ScoredDocument>> {
-        // Get reader with snapshot - doesn't block on writes
-        let reader = self.reader_pool.get_reader()?;
+        self.search_with_limit(query_str, 10) // Default limit of 10
+    }
+    
+    pub fn search_with_limit(&self, query_str: &str, limit: usize) -> Result<Vec<ScoredDocument>> {
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+        
+        // 1. Check cache first (optimized - no string allocation)
+        if let Some(cached_results) = self.query_cache.get_by_str(query_str, limit, 0) {
+            return Ok(cached_results.hits);
+        }
+        
+        // 2. Parse query string
         let query = self.query_parser.parse(query_str)?;
-
-        // Execute query on snapshot (lock-free!)
-        let results = reader.search(&query)?;
-
+        
+        // 3. Get reader with snapshot - doesn't block on writes
+        let reader = self.reader_pool.get_reader()?;
+        
+        // 4. Execute query using QueryExecutor service
+        let config = ExecutionConfig::default();
+        let results = self.query_executor.execute(&reader, &query, limit, config)?;
+        
+        // 5. Cache results for future queries (optimized - no string allocation)
+        self.query_cache.put_by_str(query_str, limit, 0, results.clone());
+        
+        // 6. Return hits
         Ok(results.hits)
+    }
+    
+    pub fn search_debug(&self, query_str: &str, limit: usize) -> Result<SearchResults> {
+        // Debug version that returns full results with explanations
+        let query = self.query_parser.parse(query_str)?;
+        let reader = self.reader_pool.get_reader()?;
+        
+        let config = ExecutionConfig::debug(); // Enables explanations
+        self.query_executor.execute(&reader, &query, limit, config)
     }
 
     // 1. User calls add_document()
@@ -113,238 +236,278 @@ impl Database {
     // 8. WAL.sync() ← Flush WAL buffer to disk
     // 9. WAL.rotate() ← Create new WAL file (effectively "truncates" old entries)
     pub fn flush(&self) -> Result<()> {
-        self.writer.write().flush()
+        let result = self.writer.write().flush();
+        if result.is_ok() {
+            *self.last_flush_time.write() = Some(SystemTime::now());
+        }
+        result
     }
 
-    pub fn commit(&mut self) -> Result<()> {
-        self.writer.write().commit()
+    pub fn commit(&self) -> Result<()> {
+        let result = self.writer.write().commit();
+        if result.is_ok() {
+            *self.last_commit_time.write() = Some(SystemTime::now());
+        }
+        result
+    }
+    
+    /// Recover from WAL after crash or restart
+    /// Should be called during database initialization
+    pub fn recover(&self) -> Result<()> {
+        // Find all WAL files
+        let storage = self.storage.clone();
+        let wal_sequences = WAL::find_wal_files(&storage)?;
+        
+        if wal_sequences.is_empty() {
+            return Ok(()); // Nothing to recover
+        }
+        
+        println!("Starting WAL recovery, found {} WAL files", wal_sequences.len());
+        let mut recovered_count = 0;
+        
+        // Process each WAL file in order
+        for sequence in wal_sequences {
+            let mut wal = WAL::open(&storage, sequence)?;
+            let entries = wal.read_entries()?;
+            
+            println!("Processing WAL sequence {}: {} entries", sequence, entries.len());
+            
+            for entry in entries {
+                match entry.operation {
+                    Operation::AddDocument(doc) => {
+                        // Re-add document to index
+                        match self.add_document(doc) {
+                            Ok(_) => recovered_count += 1,
+                            Err(e) => {
+                                eprintln!("Warning: Failed to recover document: {}", e);
+                            }
+                        }
+                    },
+                    Operation::DeleteDocument(doc_id) => {
+                        // Recover delete operation by marking document as deleted
+                        match self.delete_document(doc_id) {
+                            Ok(_) => recovered_count += 1,
+                            Err(e) => {
+                                eprintln!("Warning: Failed to recover delete for doc {}: {}", doc_id.0, e);
+                            }
+                        }
+                    },
+                    Operation::UpdateDocument(doc) => {
+                        // Update document
+                        match self.add_document(doc) {
+                            Ok(_) => recovered_count += 1,
+                            Err(e) => {
+                                eprintln!("Warning: Failed to recover document update: {}", e);
+                            }
+                        }
+                    },
+                    Operation::Commit => {
+                        // Commit operation - ensure data is persisted
+                        self.flush()?;
+                    }
+                }
+            }
+        }
+        
+        // After recovery, commit to ensure everything is persisted
+        self.commit()?;
+        
+        println!("WAL recovery completed: {} operations recovered", recovered_count);
+        Ok(())
+    }
+    
+    /// Enable transactions for this database
+    pub fn enable_transactions(self) -> Arc<Self> {
+        Arc::new(self)
+    }
+    
+    /// Create a database with transactions enabled from the start
+    pub fn with_transactions(config: Config, schema: SchemaWithAnalyzer) -> Result<Arc<Self>> {
+        let db = Self::open_with_schema(schema, config)?;
+        Ok(Arc::new(db))
+    }
+    
+    /// Begin a new transaction
+    pub fn begin_transaction(&self, isolation: crate::mvcc::controller::IsolationLevel) -> Arc<Transaction> {
+        // Create transaction directly using MVCC controller
+        Arc::new(Transaction::begin(self.mvcc.clone(), isolation))
+    }
+    
+    /// Execute in a transaction
+    pub fn with_transaction<F, R>(&self, isolation: crate::mvcc::controller::IsolationLevel, f: F) -> Result<R>
+    where
+        F: FnOnce(&Transaction) -> Result<R>,
+    {
+        let tx = self.begin_transaction(isolation);
+        
+        match f(&tx) {
+            Ok(result) => {
+                // Get operations from transaction
+                let ops = tx.commit()?;
+                
+                // Execute operations
+                for op in ops {
+                    match op {
+                        crate::core::transaction::TransactionOp::Insert(doc) => {
+                            self.add_document(doc)?;
+                        }
+                        crate::core::transaction::TransactionOp::Update(doc_id, doc) => {
+                            self.delete_document(doc_id)?;
+                            self.add_document(doc)?;
+                        }
+                        crate::core::transaction::TransactionOp::Delete(doc_id) => {
+                            self.delete_document(doc_id)?;
+                        }
+                    }
+                }
+                
+                // Flush to ensure durability
+                self.flush()?;
+                
+                Ok(result)
+            }
+            Err(e) => {
+                tx.rollback()?;
+                Err(e)
+            }
+        }
+    }
+    
+    /// Get database statistics for monitoring
+    pub fn stats(&self) -> Result<DatabaseStats> {
+        let snapshot = self.mvcc.current_snapshot();
+        let cache_stats = self.query_cache.stats();
+        
+        // Calculate query rate
+        let uptime_secs = self.start_time.elapsed().as_secs();
+        let query_count = self.query_count.load(Ordering::Relaxed);
+        let write_count = self.write_count.load(Ordering::Relaxed);
+        let queries_per_second = if uptime_secs > 0 {
+            query_count as f64 / uptime_secs as f64
+        } else {
+            0.0
+        };
+        let writes_per_second = if uptime_secs > 0 {
+            write_count as f64 / uptime_secs as f64
+        } else {
+            0.0
+        };
+        
+        // Get WAL size
+        let wal_size = self.writer.read().wal.position;
+        
+        // Calculate index size (approximate - sum of segment sizes)
+        let index_size_bytes: u64 = snapshot.segments.iter()
+            .map(|seg| seg.metadata.size_bytes as u64)
+            .sum();
+        
+        Ok(DatabaseStats {
+            uptime_secs,
+            start_time: SystemTime::now() - Duration::from_secs(uptime_secs),
+            
+            // Storage metrics
+            segment_count: snapshot.segments.len(),
+            total_documents: snapshot.doc_count,
+            deleted_documents: snapshot.deleted_docs.len() as usize,
+            index_size_bytes,
+            wal_size_bytes: wal_size,
+            
+            // Memory metrics (simplified - real impl would query pools)
+            memory_pool_usage: MemoryStats {
+                allocated_bytes: 0, // TODO: Get from memory pool
+                used_bytes: 0,
+                capacity_bytes: self.config.memory_limit,
+                utilization_percent: 0.0,
+            },
+            buffer_pool_usage: BufferStats {
+                page_count: 0, // TODO: Get from buffer pool
+                page_size: 4096,
+                hit_rate: 0.0,
+                dirty_pages: 0,
+            },
+            reader_pool_size: self.reader_pool.max_readers,
+            
+            // Query metrics
+            cache_stats,
+            queries_per_second,
+            avg_query_latency_ms: 0.0, // TODO: Track query latency
+            
+            // Write metrics
+            writes_per_second,
+            pending_writes: 0, // TODO: Track pending writes
+            last_flush_time: self.last_flush_time.read().clone(),
+            last_commit_time: self.last_commit_time.read().clone(),
+        })
+    }
+    
+    /// Health check for monitoring systems
+    pub fn health_check(&self) -> Result<HealthCheckResult> {
+        let mut checks = Vec::new();
+        let _start = Instant::now();
+        
+        // Check 1: WAL is writable
+        let wal_check_start = Instant::now();
+        let wal_status = match self.writer.try_write() {
+            Some(_writer) => HealthStatus::Healthy,
+            None => HealthStatus::Degraded("WAL is locked".to_string()),
+        };
+        checks.push(HealthCheck {
+            name: "WAL".to_string(),
+            status: wal_status.clone(),
+            message: None,
+            latency_ms: wal_check_start.elapsed().as_millis() as u64,
+        });
+        
+        // Check 2: Can get reader
+        let reader_check_start = Instant::now();
+        let reader_status = match self.reader_pool.get_reader() {
+            Ok(_) => HealthStatus::Healthy,
+            Err(e) => HealthStatus::Unhealthy(format!("Cannot get reader: {}", e)),
+        };
+        checks.push(HealthCheck {
+            name: "ReaderPool".to_string(),
+            status: reader_status.clone(),
+            message: None,
+            latency_ms: reader_check_start.elapsed().as_millis() as u64,
+        });
+        
+        // Check 3: Query cache responsive
+        let cache_check_start = Instant::now();
+        let cache_status = if self.query_cache.stats().hit_rate() >= 0.0 {
+            HealthStatus::Healthy
+        } else {
+            HealthStatus::Degraded("Cache hit rate low".to_string())
+        };
+        checks.push(HealthCheck {
+            name: "QueryCache".to_string(),
+            status: cache_status.clone(),
+            message: Some(format!("Hit rate: {:.2}%", self.query_cache.stats().hit_rate() * 100.0)),
+            latency_ms: cache_check_start.elapsed().as_millis() as u64,
+        });
+        
+        // Check 4: Disk space
+        let disk_check_start = Instant::now();
+        let disk_status = HealthStatus::Healthy; // TODO: Check actual disk space
+        checks.push(HealthCheck {
+            name: "DiskSpace".to_string(),
+            status: disk_status.clone(),
+            message: None,
+            latency_ms: disk_check_start.elapsed().as_millis() as u64,
+        });
+        
+        // Overall status
+        let overall_status = if checks.iter().all(|c| c.status == HealthStatus::Healthy) {
+            HealthStatus::Healthy
+        } else if checks.iter().any(|c| matches!(c.status, HealthStatus::Unhealthy(_))) {
+            HealthStatus::Unhealthy("One or more critical checks failed".to_string())
+        } else {
+            HealthStatus::Degraded("Some checks are degraded".to_string())
+        };
+        
+        Ok(HealthCheckResult {
+            status: overall_status,
+            checks,
+            timestamp: SystemTime::now(),
+        })
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// use std::path::PathBuf;
-// use std::sync::{Arc, RwLock};
-// use chrono::Utc;
-// use crate::core::config::Config;
-// use crate::core::types::{DocId, Document};
-// use crate::core::error::Result;
-// use crate::core::in_memory_index::{InMemoryIndex, SimpleTokenizer};
-// use crate::storage::checkpoint::{Checkpoint, RecoveryManager};
-// use crate::storage::file_lock::FileLock;
-// use crate::storage::layout::StorageLayout;
-// use crate::storage::segment::{Segment, SegmentId};
-// use crate::storage::segment_reader::SegmentReader;
-// use crate::storage::segment_writer::SegmentWriter;
-// use crate::storage::wal::{SyncMode, WAL};
-//
-// pub struct Database {
-//     pub index: Arc<RwLock<InMemoryIndex>>,
-//     pub config: Config,
-//
-//     pub storage: StorageLayout,
-//     pub wal: WAL,
-//     pub lock: FileLock,
-//     pub segments: Vec<SegmentId>,
-// }
-//
-// impl Database {
-//     /// Create new database with persistence
-//     pub fn new(path: PathBuf) -> Result<Self> {
-//         Self::open(path)
-//     }
-//
-//     /// Create in-memory database
-//     pub fn new_in_memory() -> Self {
-//         let tokenizer = Box::new(SimpleTokenizer);
-//         let index = InMemoryIndex::new(tokenizer);
-//
-//         Database {
-//             index: Arc::new(RwLock::new(index)),
-//             config: Config::default(),
-//             // No persistence components
-//             storage: StorageLayout {
-//                 base_dir: PathBuf::from("/dev/null"),
-//                 segments_dir: PathBuf::from("/dev/null"),
-//                 wal_dir: PathBuf::from("/dev/null"),
-//                 meta_dir: PathBuf::from("/dev/null"),
-//             },
-//             wal: WAL {
-//                 file: std::fs::File::create("/dev/null").unwrap(),
-//                 position: 0,
-//                 sequence: 0,
-//                 sync_mode: SyncMode::None
-//             },
-//             lock: FileLock {
-//                 file: std::fs::File::create("/dev/null").unwrap(),
-//                 exclusive: true,
-//             },
-//             segments: Vec::new(),
-//         }
-//     }
-//     pub fn add_document(&self, doc: Document) -> Result<()> {
-//         let mut index = self.index.write().unwrap();
-//         index.add_document(doc)
-//     }
-//
-//     pub fn search(&self, query: &str) -> Result<Vec<Document>> {
-//         let index = self.index.read().unwrap();
-//         index.search(query)
-//     }
-//
-//     pub fn get_document(&self, id: DocId) -> Result<Option<Document>> {
-//         let index = self.index.read().unwrap();
-//         Ok(index.documents.get(&id).cloned())
-//     }
-//
-//     pub fn delete_document(&self, id: DocId) -> Result<()> {
-//         let mut index = self.index.write().unwrap();
-//         index.delete_document(id)
-//     }
-//
-//     pub fn stats(&self) -> IndexStats {
-//         let index = self.index.read().unwrap();
-//         IndexStats {
-//             total_documents: index.total_docs,
-//             total_terms: index.terms.len(),
-//         }
-//     }
-//
-//     /// Open existing database or create new one
-//     pub fn open(path: PathBuf) -> Result<Self> {
-//         let storage = StorageLayout::new(path)?;
-//         let lock = FileLock::acquire(&storage, true)?;
-//         let mut recovery = RecoveryManager::new(storage.clone())?;
-//
-//         // Recover from crash
-//         let operations = recovery.recover()?;
-//         // Build index from segments
-//         let (index, segments) = Self::load_segments(&storage)?;
-//         // Replay operations
-//         for op in operations {
-//             // Apply operation to index
-//         }
-//
-//         Ok(Database {
-//             index: Arc::new(RwLock::new(index)),
-//             config: Config::default(),
-//             storage,
-//             wal: recovery.wal,
-//             lock,
-//             segments
-//         })
-//     }
-//
-//     /// Persist current state
-//     pub fn commit(&mut self) -> Result<()> {
-//         // Write current batch to segment
-//         let segment = self.flush_to_segment()?;
-//
-//         // Update checkpoint
-//         self.create_checkpoint(vec![segment.id])?;
-//
-//         // Rotate WAL
-//         self.wal.rotate(&self.storage)?;
-//
-//         Ok(())
-//     }
-//
-//     /// Force sync to disk
-//     pub fn sync(&mut self) -> Result<()> {
-//         self.wal.file.sync_all()?;
-//         Ok(())
-//     }
-//
-//     /// Load segments from disk into memory
-//     fn load_segments(storage: &StorageLayout) -> Result<(InMemoryIndex, Vec<SegmentId>)> {
-//         // Load checkpoint to get active segments
-//         let checkpoint = match Checkpoint::load(storage)? {
-//             Some(cp) => cp,
-//             None => {
-//                 // No checkpoint, create empty index
-//                 let tokenizer = Box::new(SimpleTokenizer);
-//                 return Ok((InMemoryIndex::new(tokenizer), Vec::new()));
-//             }
-//         };
-//
-//         // Create empty index
-//         let tokenizer = Box::new(SimpleTokenizer);
-//         let mut index = InMemoryIndex::new(tokenizer);
-//
-//         // Load each segment
-//         for segment_id in &checkpoint.segments {
-//             let mut reader = SegmentReader::open(storage, *segment_id)?;
-//             let documents = reader.read_all_documents()?;
-//
-//             // Add documents to index
-//             for doc in documents {
-//                 index.add_document(doc)?;
-//             }
-//         }
-//
-//         Ok((index, checkpoint.segments))
-//     }
-//
-//     /// Flush current index to new segment
-//     fn flush_to_segment(&mut self) -> Result<Segment> {
-//         let segment_id = SegmentId::new();
-//         let mut writer = SegmentWriter::new(&self.storage, segment_id)?;
-//
-//         // Write all documents from index
-//         let index = self.index.read().unwrap();
-//         for (_, doc) in &index.documents {
-//             writer.write_document(doc)?;
-//         }
-//
-//         let segment = writer.finish()?;
-//         self.segments.push(segment_id);
-//
-//         Ok(segment)
-//     }
-//
-//     /// Create checkpoint with current segments
-//     fn create_checkpoint(&self, segment_ids: Vec<SegmentId>) -> Result<()> {
-//         let checkpoint = Checkpoint {
-//             wal_position: self.wal.sequence,
-//             segments: segment_ids,
-//             timestamp: Utc::now(),
-//             doc_count: self.index.read().unwrap().documents.len(),
-//         };
-//
-//         checkpoint.save(&self.storage)?;
-//         Ok(())
-//     }
-// }
-//
-// #[derive(Debug, Clone)]
-// pub struct IndexStats {
-//     pub total_documents: usize,
-//     pub total_terms: usize,
-// }

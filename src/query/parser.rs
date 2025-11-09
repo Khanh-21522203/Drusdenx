@@ -1,10 +1,10 @@
 use chrono::{DateTime, Utc};
-use nom::{IResult, bytes::complete::*, character::complete::*, combinator::*, multi::*, sequence::*};
 use crate::core::error::{Error, ErrorKind, Result};
 use crate::core::types::FieldValue;
 use crate::query::ast::{BoolQuery, PhraseQuery, Query, RangeQuery, TermQuery};
 
 /// Query parser for converting string queries to AST
+#[derive(Clone)]
 pub struct QueryParser {
     pub default_field: String,
     pub default_operator: BooleanOperator,
@@ -115,7 +115,7 @@ impl QueryParser {
     fn parse_boolean_query(&self, tokens: &[&str]) -> Result<Query> {
         let mut bool_query = BoolQuery::new();
         let mut current_op = self.default_operator;
-        let mut current_term = String::new();
+        let current_term = String::new();
 
         for token in tokens {
             match *token {
@@ -154,7 +154,7 @@ impl QueryParser {
 
         let parts: Vec<&str> = inner.split(" TO ").collect();
         if parts.len() != 2 {
-            return Err(Error::new(ErrorKind::Parse, "Invalid range query".parse().unwrap()));
+            return Err(Error::new(ErrorKind::Parse, "Invalid range query".to_string()));
         }
 
         let mut range = RangeQuery {

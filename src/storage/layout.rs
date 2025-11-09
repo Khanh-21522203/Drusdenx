@@ -42,4 +42,8 @@ impl StorageLayout {
     pub fn checkpoint_path(&self) -> PathBuf {
         self.meta_dir.join("checkpoint.bin")
     }
+    
+    pub fn wal_dir(&self) -> &PathBuf {
+        &self.wal_dir
+    }
 }

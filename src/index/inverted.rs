@@ -1,15 +1,26 @@
-use fst::Map;
 use std::collections::HashMap;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use crate::analysis::token::Token;
 use crate::core::error::{Error, ErrorKind, Result};
 use crate::core::types::DocId;
 use crate::core::utils::levenshtein_distance;
 use crate::index::posting::{Posting, PostingList};
+use crate::index::skiplist::SkipList;
 use crate::search::prefix::PrefixIndex;
+use crate::simd::operation::SimdOps;
+
+/// Index statistics for scoring and monitoring
+#[derive(Debug, Clone)]
+pub struct IndexStats {
+    pub doc_count: usize,
+    pub total_tokens: usize,
+    pub unique_terms: usize,
+    pub avg_doc_length: f32,
+}
 
 /// Term representation
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Term(Vec<u8>);
 
 impl Term {
@@ -19,7 +30,7 @@ impl Term {
 
     pub fn as_str(&self) -> Result<&str> {
         std::str::from_utf8(&self.0)
-            .map_err(|_| Error::new(ErrorKind::Parse, "Invalid UTF-8 in term".parse().unwrap()))
+            .map_err(|_| Error::new(ErrorKind::Parse, "Invalid UTF-8 in term".to_string()))
     }
 }
 
@@ -27,6 +38,7 @@ impl Term {
 pub struct InvertedIndex {
     pub dictionary: TermDictionary,
     pub postings: HashMap<Term, PostingList>,
+    pub skip_lists: HashMap<Term, SkipList>,
     pub doc_count: usize,
     pub total_tokens: usize,
     pub prefix_index: Option<PrefixIndex>,
@@ -37,6 +49,7 @@ impl InvertedIndex {
         InvertedIndex {
             dictionary: TermDictionary::new(),
             postings: HashMap::new(),
+            skip_lists: HashMap::new(),
             doc_count: 0,
             total_tokens: 0,
             prefix_index: None,
@@ -57,11 +70,11 @@ impl InvertedIndex {
         Ok(())
     }
 
-    // ✅ ADD: Search for terms matching prefix
+    // ADD: Search for terms matching prefix
     pub fn prefix_search(&self, prefix: &str) -> Result<Vec<String>> {
         match &self.prefix_index {
             Some(index) => Ok(index.search_prefix(prefix)),
-            None => Err(Error::new(ErrorKind::InvalidState, "Prefix index not built".parse().unwrap())),
+            None => Err(Error::new(ErrorKind::InvalidState, "Prefix index not built".to_string())),
         }
     }
     
@@ -85,11 +98,32 @@ impl InvertedIndex {
                 field_norm: 1.0 / (tokens.len() as f32).sqrt(), // Simple normalization
             };
 
-            self.postings.entry(term.clone())
-                .or_insert_with(PostingList::new)
-                .add_posting(posting);
+            // Get existing postings or create empty vec
+            let mut all_postings = if let Some(existing_list) = self.postings.get(&term) {
+                // Decode existing postings
+                existing_list.iter()?
+            } else {
+                Vec::new()
+            };
 
-            self.dictionary.add_term(&term, self.postings[&term].doc_freq());
+            // Add new posting
+            all_postings.push(posting);
+
+            // Sort by doc_id (required for delta encoding)
+            all_postings.sort_by_key(|p| p.doc_id);
+
+            // Rebuild PostingList with all postings (including new one)
+            let new_posting_list = PostingList::new(all_postings)?;
+            self.postings.insert(term.clone(), new_posting_list);
+
+            // Update dictionary with term statistics
+            if let Some(posting_list) = self.postings.get(&term) {
+                self.dictionary.add_term(&term, posting_list.doc_freq());
+
+                // Build skip list for fast querying
+                let skip_list = SkipList::build(posting_list)?;
+                self.skip_lists.insert(term.clone(), skip_list);
+            }
         }
 
         self.doc_count += 1;
@@ -97,7 +131,96 @@ impl InvertedIndex {
 
         Ok(())
     }
+    
+    /// Get current index statistics
+    pub fn stats(&self) -> IndexStats {
+        let unique_terms = self.dictionary.term_count();
+        let avg_doc_length = if self.doc_count > 0 {
+            self.total_tokens as f32 / self.doc_count as f32
+        } else {
+            0.0
+        };
+        
+        IndexStats {
+            doc_count: self.doc_count,
+            total_tokens: self.total_tokens,
+            unique_terms,
+            avg_doc_length,
+        }
+    }
 
+    pub fn intersect_terms(&self, terms: &[Term]) -> Result<Vec<DocId>> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Get posting lists and convert to sorted arrays for SIMD operations
+        let mut sorted_arrays: Vec<Vec<u32>> = Vec::new();
+
+        for term in terms {
+            if let Some(list) = self.postings.get(term) {
+                // Extract doc IDs as sorted u32 array
+                let doc_ids: Vec<u32> = list.iter()?
+                    .into_iter()
+                    .map(|posting| posting.doc_id.0 as u32)
+                    .collect();
+                sorted_arrays.push(doc_ids);
+            } else {
+                return Ok(Vec::new());  // Term not found
+            }
+        }
+        
+        if sorted_arrays.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Use SIMD operations for fast intersection
+        let mut result = sorted_arrays[0].clone();
+        for i in 1..sorted_arrays.len() {
+            result = SimdOps::intersect_sorted(&result, &sorted_arrays[i]);
+            if result.is_empty() {
+                break;
+            }
+        }
+        
+        // Convert back to DocId
+        Ok(result.into_iter().map(|id| DocId(id as u64)).collect())
+    }
+
+    /// Union multiple terms using SIMD operations
+    pub fn union_terms(&self, terms: &[Term]) -> Result<Vec<DocId>> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // Collect all doc IDs from all terms
+        let mut sorted_arrays: Vec<Vec<u32>> = Vec::new();
+        
+        for term in terms {
+            if let Some(list) = self.postings.get(term) {
+                let doc_ids: Vec<u32> = list.iter()?
+                    .into_iter()
+                    .map(|posting| posting.doc_id.0 as u32)
+                    .collect();
+                sorted_arrays.push(doc_ids);
+            }
+            // Note: We don't return empty if a term is not found (union semantics)
+        }
+        
+        if sorted_arrays.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // Use SIMD operations for fast union
+        let mut result = sorted_arrays[0].clone();
+        for i in 1..sorted_arrays.len() {
+            result = SimdOps::union_sorted(&result, &sorted_arrays[i]);
+        }
+        
+        // Convert back to DocId
+        Ok(result.into_iter().map(|id| DocId(id as u64)).collect())
+    }
+    
     pub fn search_term(&self, term: &Term) -> Option<&PostingList> {
         self.postings.get(term)
     }
@@ -222,5 +345,9 @@ impl TermDictionary {
 
     pub fn is_empty(&self) -> bool {
         self.term_infos.is_empty()
+    }
+    
+    pub fn term_count(&self) -> usize {
+        self.term_map.len()
     }
 }

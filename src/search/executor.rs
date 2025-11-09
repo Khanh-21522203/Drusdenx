@@ -1,497 +1,501 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use parking_lot::RwLock;
-use crate::core::types::{DocId, Document, FieldValue};
+use crate::core::types::DocId;
 use crate::index::inverted::{InvertedIndex, Term};
-use crate::query::cache::{QueryCache, QueryKey};
 use crate::query::optimizer::QueryOptimizer;
-use crate::query::parser::QueryParser;
-use crate::query::planner::{LogicalPlan, QueryPlanner};
+use crate::query::planner::{QueryPlanner, LogicalPlan};
 use crate::query::types::{IndexStatistics, QueryValidator, ValidationConfig};
-use crate::scoring::scorer::{BM25Scorer, Scorer};
-use crate::search::results::{ScoredDocument, SearchResults, TopKCollector};
-use crate::core::error::{Error, Result};
-use crate::core::error::ErrorKind::UnsupportedQuery;
-use crate::query::ast::{BoolQuery, FuzzyQuery, PhraseQuery, PrefixQuery, Query, RangeQuery, TermQuery, WildcardQuery};
+use crate::reader::reader_pool::IndexReader;
+use crate::scoring::scorer::{BM25Scorer, TfIdfScorer, Scorer, DocStats};
+use crate::search::results::{ScoredDocument, SearchResults, TopKCollector, ScoreExplanation};
+use crate::core::error::Result;
+use crate::query::ast::{Query, TermQuery, BoolQuery};
+use crate::query::matcher::{DocumentMatcher, SegmentSearch};
 
-/// Execute queries with optimization and caching
+/// Scoring algorithm selection
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoringAlgorithm {
+    BM25,
+    TfIdf,
+    None, // Simple scoring (1.0 for all matches)
+}
+
+/// Query execution configuration
+#[derive(Debug, Clone)]
+pub struct ExecutionConfig {
+    pub scoring: ScoringAlgorithm,
+    pub enable_optimization: bool,
+    pub enable_validation: bool,
+    pub collect_explanations: bool,
+    pub timeout_ms: Option<u64>,
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        ExecutionConfig {
+            scoring: ScoringAlgorithm::BM25, // BM25 by default
+            enable_optimization: true,
+            enable_validation: true,
+            collect_explanations: false,
+            timeout_ms: Some(30000), // 30 seconds default
+        }
+    }
+}
+
+impl ExecutionConfig {
+    /// Create a simple config for fast execution without optimization
+    pub fn simple() -> Self {
+        ExecutionConfig {
+            scoring: ScoringAlgorithm::None, // No scoring for speed
+            enable_optimization: false,
+            enable_validation: false,
+            collect_explanations: false,
+            timeout_ms: Some(10000),
+        }
+    }
+    
+    /// Create a debug config with explanations
+    pub fn debug() -> Self {
+        ExecutionConfig {
+            scoring: ScoringAlgorithm::BM25,
+            enable_optimization: true,
+            enable_validation: true,
+            collect_explanations: true,
+            timeout_ms: None,
+        }
+    }
+    
+    /// Create config with specific scoring algorithm
+    pub fn with_scoring(algorithm: ScoringAlgorithm) -> Self {
+        ExecutionConfig {
+            scoring: algorithm,
+            ..Default::default()
+        }
+    }
+    
+    /// Create BM25 config
+    pub fn bm25() -> Self {
+        Self::with_scoring(ScoringAlgorithm::BM25)
+    }
+    
+    /// Create TF-IDF config
+    pub fn tfidf() -> Self {
+        Self::with_scoring(ScoringAlgorithm::TfIdf)
+    }
+}
+
+// No need for SimpleScorer - when scoring is disabled, we use the score from DocumentMatcher
+
+/// Query executor service (stateless)
+/// 
+/// This executor does NOT own any data or cache. It operates on provided IndexReader instances.
+/// 
+/// # Example
+/// ```rust
+/// let executor = QueryExecutor::new();
+/// let reader = reader_pool.get_reader()?;
+/// let query = parser.parse("rust programming")?;
+/// let results = executor.execute(&reader, &query, 10, ExecutionConfig::default())?;
+/// ```
 pub struct QueryExecutor {
-    pub index: Arc<InvertedIndex>,
-    pub documents: Arc<RwLock<HashMap<DocId, Document>>>,
-    pub planner: QueryPlanner,
     pub optimizer: QueryOptimizer,
-    pub cache: QueryCache,
-    pub scorer: Box<dyn Scorer>,
+    pub validator_config: ValidationConfig,
 }
 
 impl QueryExecutor {
-    pub fn new(index: Arc<InvertedIndex>, documents: Arc<RwLock<HashMap<DocId, Document>>>,) -> Self {
-        let statistics = IndexStatistics::from_index(&index);
-
+    /// Create a new query executor
+    pub fn new() -> Self {
         QueryExecutor {
-            index: index.clone(),
-            documents,
-            planner: QueryPlanner::new(statistics.clone()),
             optimizer: QueryOptimizer::new(),
-            cache: QueryCache::new(1000),
-            scorer: Box::new(BM25Scorer::default()),
+            validator_config: ValidationConfig::default(),
+        }
+    }
+    
+    /// Create with custom configuration
+    pub fn with_config(validator_config: ValidationConfig) -> Self {
+        QueryExecutor {
+            optimizer: QueryOptimizer::new(),
+            validator_config,
         }
     }
 
-    pub fn execute(&self, query_str: &str, limit: usize) -> Result<SearchResults> {
-        // Check cache first
-        let key = QueryKey {
-            query: query_str.to_string(),
-            limit,
-            offset: 0,
+    /// Execute a query on the provided IndexReader
+    /// 
+    /// # Arguments
+    /// * `reader` - The IndexReader containing segments and index
+    /// * `query` - The parsed query to execute
+    /// * `limit` - Maximum number of results to return
+    /// * `config` - Execution configuration
+    /// 
+    /// # Returns
+    /// * `SearchResults` containing matched documents with scores
+    pub fn execute(
+        &self,
+        reader: &IndexReader,
+        query: &Query,
+        limit: usize,
+        config: ExecutionConfig,
+    ) -> Result<SearchResults> {
+        let start = std::time::Instant::now();
+
+        // 1. Validate query if enabled
+        if config.enable_validation {
+            let stats = IndexStatistics::from_index(&reader.index);
+            let validator = QueryValidator::new(self.validator_config.clone(), stats);
+            validator.validate(query)?;
+        }
+
+        // 2. Optimize query if enabled
+        let optimized_query = if config.enable_optimization {
+            self.optimize_query(query, &reader.index)?
+        } else {
+            query.clone()
         };
 
-        if let Some(results) = self.cache.get(&key) {
-            return Ok(results);
-        }
-
-        // Parse query
-        let parser = QueryParser::new();
-        let query = parser.parse(query_str)?;
-
-        // Validate query
-        let validator = QueryValidator::new(ValidationConfig::default(),
-                                            self.planner.statistics.clone());
-        validator.validate(&query)?;
-
-        // Plan and optimize
-        let plan = self.planner.plan(&query);
-        let optimized_plan = self.optimizer.optimize(plan);
-
-        // Execute plan
-        let results = self.execute_plan(&optimized_plan, limit)?;
-
-        // Cache results
-        self.cache.put(key, results.clone());
-
-        Ok(results)
-    }
-
-    pub fn execute_query(&self, query: &Query, limit: usize) -> Result<SearchResults> {
-        let start = std::time::Instant::now();
+        // 3. Create collector for top-K results
         let mut collector = TopKCollector::new(limit);
 
-        self.execute_query_internal(query, &mut collector)?;
+        // 4. Execute on reader's segments
+        self.execute_on_segments(reader, &optimized_query, &mut collector, &config)?;
 
-        let total_collected = collector.total_collected;
+        // 5. Build final results
+        let total_hits = collector.total_collected;
         let max_score = collector.max_score();
-        let hits = collector.get_results();
+        let hits = collector.get_results(); // This consumes collector, must be last
 
         Ok(SearchResults {
             hits,
-            total_hits: total_collected,
+            total_hits,
             max_score,
             took_ms: start.elapsed().as_millis() as u64,
         })
     }
 
-
-    fn execute_query_internal(&self, query: &Query, collector: &mut TopKCollector) -> Result<()> {
-        match query {
-            Query::MatchAll => self.execute_match_all(collector)?,
-            Query::Term(tq) => self.execute_term_internal(tq, collector)?,
-            Query::Phrase(pq) => self.execute_phrase_internal(pq, collector)?,
-            Query::Bool(bq) => self.execute_bool_internal(bq, collector)?,
-            Query::Range(rq) => self.execute_range_internal(rq, collector)?,
-            Query::Prefix(pq) => self.execute_prefix(pq, collector)?,
-            Query::Wildcard(wq) => self.execute_wildcard(wq, collector)?,
-            Query::Fuzzy(fq) => self.execute_fuzzy(fq, collector)?,
-        }
-        Ok(())
+    /// Execute query with simple configuration (convenience method)
+    pub fn execute_simple(
+        &self,
+        reader: &IndexReader,
+        query: &Query,
+        limit: usize,
+    ) -> Result<SearchResults> {
+        self.execute(reader, query, limit, ExecutionConfig::simple())
     }
 
-    fn execute_match_all(&self, collector: &mut TopKCollector) -> Result<()> {
-        // Match all documents
-        for doc_id in 0..self.index.doc_count {
-            collector.collect(ScoredDocument {
-                doc_id: DocId(doc_id as u64),
-                score: 1.0,
-                document: None,
-                explanation: None,
-            });
-        }
-        Ok(())
+    /// Optimize a query based on index statistics
+    fn optimize_query(&self, query: &Query, index: &InvertedIndex) -> Result<Query> {
+        // Create planner with current index statistics
+        let stats = IndexStatistics::from_index(index);
+        let planner = QueryPlanner::new(stats);
+        
+        // Generate logical plan
+        let plan = planner.plan(query);
+        
+        // Optimize the plan
+        let optimized_plan = self.optimizer.optimize(plan);
+        
+        // Convert plan back to query
+        self.plan_to_query(optimized_plan)
     }
-
-    fn execute_term_internal(&self, query: &TermQuery, collector: &mut TopKCollector) -> Result<()> {
-        // Single term search
-        let term = Term::new(&query.value);
-        if let Some(posting_list) = self.index.search_term(&term) {
-            for posting in &posting_list.postings {
-                let score = (posting.term_freq as f32) * query.boost.unwrap_or(1.0);
-                collector.collect(ScoredDocument {
-                    doc_id: posting.doc_id,
-                    score,
-                    document: None,
-                    explanation: None,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn execute_phrase_internal(&self, query: &PhraseQuery, collector: &mut TopKCollector) -> Result<()> {
-        // Phrase search - check positions are adjacent
-        // (Simplified - see M05 DocumentMatcher for full implementation)
-        let terms: Vec<Term> = query.phrase.iter().map(|s| Term::new(s)).collect();
-
-        // Find documents where all terms appear
-        let mut candidates: Option<HashSet<DocId>> = None;
-
-        for term in &terms {
-            if let Some(posting_list) = self.index.search_term(term) {
-                let term_docs: HashSet<DocId> = posting_list.postings.iter()
-                    .map(|p| p.doc_id)
-                    .collect();
-
-                candidates = match candidates {
-                    None => Some(term_docs),
-                    Some(docs) => Some(docs.intersection(&term_docs).copied().collect()),
-                };
-            } else {
-                // If any term not found, no results
-                return Ok(());
-            }
-        }
-
-        // For each candidate, verify positions are adjacent (with slop tolerance)
-        if let Some(docs) = candidates {
-            for doc_id in docs {
-                // Check if positions match with slop tolerance
-                // Simplified: Just collect with fixed score
-                // Full implementation would verify position constraints
-                collector.collect(ScoredDocument {
-                    doc_id,
-                    score: query.boost.unwrap_or(1.0),
-                    document: None,
-                    explanation: None,
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    fn execute_bool_internal(&self, query: &BoolQuery, collector: &mut TopKCollector) -> Result<()> {
-        // Boolean query - combine must/should/must_not
-        let mut must_docs = HashSet::new();
-        let mut should_docs = HashSet::new();
-        let mut must_not_docs = HashSet::new();
-
-        // Execute must clauses (AND)
-        for clause in &query.must {
-            let results = self.execute_query(clause, usize::MAX)?;
-            let docs: HashSet<DocId> = results.hits.iter().map(|h| h.doc_id).collect();
-            if must_docs.is_empty() {
-                must_docs = docs;
-            } else {
-                must_docs.retain(|id| docs.contains(id));
-            }
-        }
-
-        // Execute should clauses (OR)
-        for clause in &query.should {
-            let results = self.execute_query(clause, usize::MAX)?;
-            should_docs.extend(results.hits.iter().map(|h| h.doc_id));
-        }
-
-        // Execute must_not clauses (NOT)
-        for clause in &query.must_not {
-            let results = self.execute_query(clause, usize::MAX)?;
-            must_not_docs.extend(results.hits.iter().map(|h| h.doc_id));
-        }
-
-        // Combine: (must AND (should OR empty)) NOT must_not
-        let final_docs: HashSet<DocId> = if !must_docs.is_empty() {
-            must_docs.iter().copied().filter(|id| !must_not_docs.contains(id)).collect()
-        } else if !should_docs.is_empty() {
-            should_docs.iter().copied().filter(|id| !must_not_docs.contains(id)).collect()
-        } else {
-            HashSet::new()
-        };
-
-        for doc_id in final_docs {
-            collector.collect(ScoredDocument {
-                doc_id,
-                score: query.boost.unwrap_or(1.0),
-                document: None,
-                explanation: None,
-            });
-        }
-
-        Ok(())
-    }
-
-    fn execute_range_internal(&self, query: &RangeQuery, collector: &mut TopKCollector) -> Result<()> {
-        // Range query on numeric/date fields
-        // Scan all documents and check if field values match range bounds
-
-        let docs = self.documents.read();
-
-        for doc_id in 0..self.index.doc_count {
-            let doc_id_obj = DocId(doc_id as u64);
-
-            // Get document from storage
-            if let Some(doc) = docs.get(&doc_id_obj) {
-                // Get field value
-                if let Some(field_value) = doc.fields.get(&query.field) {
-                    // Check if value is within range
-                    if self.matches_range_bounds(field_value, query) {
-                        collector.collect(ScoredDocument {
-                            doc_id: doc_id_obj,
-                            score: query.boost.unwrap_or(1.0),
-                            document: None,
-                            explanation: None,
-                        });
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn matches_range_bounds(&self, value: &FieldValue, query: &RangeQuery) -> bool {
-        match value {
-            FieldValue::Number(num) => {
-                // Check gt (greater than)
-                if let Some(FieldValue::Number(gt)) = &query.gt {
-                    if num <= gt {
-                        return false;
-                    }
-                }
-
-                // Check gte (greater than or equal)
-                if let Some(FieldValue::Number(gte)) = &query.gte {
-                    if num < gte {
-                        return false;
-                    }
-                }
-
-                // Check lt (less than)
-                if let Some(FieldValue::Number(lt)) = &query.lt {
-                    if num >= lt {
-                        return false;
-                    }
-                }
-
-                // Check lte (less than or equal)
-                if let Some(FieldValue::Number(lte)) = &query.lte {
-                    if num > lte {
-                        return false;
-                    }
-                }
-
-                true
-            }
-            FieldValue::Date(date) => {
-                // Check gt (greater than)
-                if let Some(FieldValue::Date(gt)) = &query.gt {
-                    if date <= gt {
-                        return false;
-                    }
-                }
-
-                // Check gte (greater than or equal)
-                if let Some(FieldValue::Date(gte)) = &query.gte {
-                    if date < gte {
-                        return false;
-                    }
-                }
-
-                // Check lt (less than)
-                if let Some(FieldValue::Date(lt)) = &query.lt {
-                    if date >= lt {
-                        return false;
-                    }
-                }
-
-                // Check lte (less than or equal)
-                if let Some(FieldValue::Date(lte)) = &query.lte {
-                    if date > lte {
-                        return false;
-                    }
-                }
-
-                true
-            }
-            FieldValue::Text(_) => {
-                // Text fields don't support range queries
-                false
-            }
-            _ => false,
-        }
-    }
-    fn execute_prefix(&self, query: &PrefixQuery, collector: &mut TopKCollector) -> Result<()> {
-        // Prefix search using FST (fast autocomplete)
-        // Example: "hel" matches "hello", "help", "helicopter"
-
-        // Use InvertedIndex.prefix_search() to find matching terms
-        let matching_terms = self.index.prefix_search(&query.prefix)?;
-
-        let mut seen_docs = HashSet::new();
-        for term_str in matching_terms {
-            let term = Term::new(&term_str);
-            if let Some(posting_list) = self.index.search_term(&term) {
-                for posting in &posting_list.postings {
-                    if seen_docs.insert(posting.doc_id) {
-                        let score = (posting.term_freq as f32) * query.boost.unwrap_or(1.0);
-                        collector.collect(ScoredDocument {
-                            doc_id: posting.doc_id,
-                            score,
-                            document: None,
-                            explanation: None,
-                        });
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn execute_wildcard(&self, query: &WildcardQuery, collector: &mut TopKCollector) -> Result<()> {
-        // Wildcard supports: * (any chars), ? (single char)
-        // Example: "hel*" matches "hello", "help", "helicopter"
-        // Example: "h?llo" matches "hello", "hallo"
-
-        // Convert wildcard pattern to regex or FST automaton
-        let matching_terms = self.index.wildcard_search(&query.pattern)?;
-
-        let mut seen_docs = HashSet::new();
-        for term_str in matching_terms {
-            let term = Term::new(&term_str);
-            if let Some(posting_list) = self.index.search_term(&term) {
-                for posting in &posting_list.postings {
-                    if seen_docs.insert(posting.doc_id) {
-                        let score = (posting.term_freq as f32) * query.boost.unwrap_or(1.0);
-                        collector.collect(ScoredDocument {
-                            doc_id: posting.doc_id,
-                            score,
-                            document: None,
-                            explanation: None,
-                        });
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn execute_fuzzy(&self, query: &FuzzyQuery, collector: &mut TopKCollector) -> Result<()> {
-        // Fuzzy search using Levenshtein distance
-        // Example: "hello" with max_edits=1 matches "hallo", "hullo", "hell"
-
-        // Use Levenshtein automaton to find terms within edit distance
-        let matching_terms = self.index.fuzzy_search(
-            &query.term,
-            query.max_edits.unwrap_or(2),
-            query.prefix_length.unwrap_or(0),
-        )?;
-
-        let mut seen_docs = HashSet::new();
-        for (term_str, edit_distance) in matching_terms {
-            let term = Term::new(&term_str);
-            if let Some(posting_list) = self.index.search_term(&term) {
-                for posting in &posting_list.postings {
-                    if seen_docs.insert(posting.doc_id) {
-                        // Score decreases with edit distance
-                        let distance_penalty = 1.0 - (edit_distance as f32 * 0.2);
-                        let score = (posting.term_freq as f32) * distance_penalty * query.boost.unwrap_or(1.0);
-
-                        collector.collect(ScoredDocument {
-                            doc_id: posting.doc_id,
-                            score,
-                            document: None,
-                            explanation: None,
-                        });
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn execute_plan(&self, plan: &LogicalPlan, limit: usize) -> Result<SearchResults> {
-        let start = std::time::Instant::now();
-        let mut collector = TopKCollector::new(limit);
-
+    
+    /// Convert logical plan back to Query AST for execution
+    fn plan_to_query(&self, plan: LogicalPlan) -> Result<Query> {
         match plan {
             LogicalPlan::IndexSeek { field, term } => {
-                // Get posting list from index
-                let term_obj = Term::new(term);
-                if let Some(posting_list) = self.index.search_term(&term_obj) {
-                    for posting in &posting_list.postings {
-                        // Score and collect
-                        let score = 1.0; // Simplified scoring
-                        collector.collect(ScoredDocument {
-                            doc_id: posting.doc_id,
-                            score,
-                            document: None,
-                            explanation: None,
-                        });
+                // Convert index seek to term query
+                Ok(Query::Term(TermQuery {
+                    field,
+                    value: term,
+                    boost: None,
+                }))
+            }
+            
+            LogicalPlan::Filter { predicate, .. } => {
+                // Filter predicates are already queries
+                Ok(predicate)
+            }
+            
+            LogicalPlan::Union { inputs } => {
+                // Convert union to boolean should query
+                let mut should_clauses = Vec::new();
+                for input in inputs {
+                    should_clauses.push(self.plan_to_query(input)?);
+                }
+                
+                Ok(Query::Bool(BoolQuery {
+                    must: vec![],
+                    should: should_clauses,
+                    must_not: vec![],
+                    filter: vec![],
+                    boost: None,
+                    minimum_should_match: Some(1),
+                }))
+            }
+            
+            LogicalPlan::Intersection { inputs } => {
+                // Convert intersection to boolean must query
+                let mut must_clauses = Vec::new();
+                for input in inputs {
+                    must_clauses.push(self.plan_to_query(input)?);
+                }
+                
+                Ok(Query::Bool(BoolQuery {
+                    must: must_clauses,
+                    should: vec![],
+                    must_not: vec![],
+                    filter: vec![],
+                    boost: None,
+                    minimum_should_match: None,
+                }))
+            }
+            
+            LogicalPlan::Difference { left, right } => {
+                // Convert difference to must with must_not
+                let left_query = self.plan_to_query(*left)?;
+                let right_query = self.plan_to_query(*right)?;
+                
+                Ok(Query::Bool(BoolQuery {
+                    must: vec![left_query],
+                    should: vec![],
+                    must_not: vec![right_query],
+                    filter: vec![],
+                    boost: None,
+                    minimum_should_match: None,
+                }))
+            }
+            
+            LogicalPlan::Limit { input, .. } => {
+                // Limit doesn't affect query structure, just execution
+                self.plan_to_query(*input)
+            }
+            
+            LogicalPlan::Sort { input, .. } => {
+                // Sort doesn't affect query structure, just result ordering
+                self.plan_to_query(*input)
+            }
+            
+            LogicalPlan::Scan { field: _ } => {
+                // Full scan - convert to match all
+                Ok(Query::MatchAll)
+            }
+        }
+    }
+
+    /// Execute query on IndexReader's segments with configurable scoring
+    fn execute_on_segments(
+        &self,
+        reader: &IndexReader,
+        query: &Query,
+        collector: &mut TopKCollector,
+        config: &ExecutionConfig,
+    ) -> Result<()> {
+        // Get index statistics for scoring
+        let stats = IndexStatistics::from_index(&reader.index);
+        
+        // Create document matcher for query evaluation (filtering)
+        let matcher = DocumentMatcher::new(reader.index.clone());
+        
+        // Process each segment
+        for segment_reader in &reader.segments {
+            // Get READ lock on segment reader for concurrent reads
+            let seg_reader = segment_reader.read();
+            
+            // Get matched documents (for filtering)
+            let matches = seg_reader.search(query, &matcher)?;
+            
+            // Process matched documents
+            for doc in matches {
+                // Skip deleted documents
+                if reader.deleted_docs.contains(doc.doc_id.0 as u32) {
+                    continue;
+                }
+                
+                // Calculate score based on selected algorithm
+                let final_score = match config.scoring {
+                    ScoringAlgorithm::BM25 => {
+                        let scorer = BM25Scorer::default();
+                        self.calculate_score(doc.doc_id, query, &reader.index, &scorer, &stats)?
+                    }
+                    ScoringAlgorithm::TfIdf => {
+                        let scorer = TfIdfScorer::new(true); // normalized TF-IDF
+                        self.calculate_score(doc.doc_id, query, &reader.index, &scorer, &stats)?
+                    }
+                    ScoringAlgorithm::None => {
+                        1.0 // Simple scoring
+                    }
+                };
+                
+                let scored_doc = ScoredDocument {
+                    doc_id: doc.doc_id,
+                    score: final_score,
+                    document: doc.document,
+                    explanation: if config.collect_explanations {
+                        Some(self.generate_score_explanation(doc.doc_id, query, final_score, &reader.index)?)
+                    } else {
+                        None
+                    },
+                };
+                
+                // Collect result
+                collector.collect(scored_doc);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Calculate score for a document given a query and scorer
+    fn calculate_score<S: Scorer>(
+        &self,
+        doc_id: DocId,
+        query: &Query,
+        index: &InvertedIndex,
+        scorer: &S,
+        stats: &IndexStatistics,
+    ) -> Result<f32> {
+        match query {
+            Query::Term(term_query) => {
+                self.score_term_query(doc_id, term_query, index, scorer, stats)
+            }
+            Query::Bool(bool_query) => {
+                self.score_bool_query(doc_id, bool_query, index, scorer, stats)
+            }
+            Query::Phrase(_phrase_query) => {
+                // For phrase queries, use simple scoring for now
+                // Proper phrase scoring would require position-aware scoring
+                Ok(1.0)
+            }
+            _ => Ok(1.0), // Other query types use simple scoring
+        }
+    }
+    
+    /// Score a single term query using the provided scorer
+    fn score_term_query<S: Scorer>(
+        &self,
+        doc_id: DocId,
+        term_query: &TermQuery,
+        index: &InvertedIndex,
+        scorer: &S,
+        stats: &IndexStatistics,
+    ) -> Result<f32> {
+        let term = Term::new(&term_query.value);
+        
+        // Get posting list for term
+        if let Some(posting_list) = index.search_term(&term) {
+            // Get term info for IDF
+            if let Some(term_info) = index.dictionary.get_term_info(&term) {
+                // Find posting for this document
+                for posting in &posting_list.iter()? {
+                    if posting.doc_id == doc_id {
+                        // Calculate doc stats
+                        let doc_stats = DocStats {
+                            doc_length: posting.positions.len(),
+                            avg_doc_length: stats.avg_doc_length,
+                            total_docs: stats.total_docs,
+                        };
+                        
+                        // Calculate BM25 score
+                        let score = scorer.score(&posting, term_info, &doc_stats);
+                        return Ok(score * term_query.boost.unwrap_or(1.0));
                     }
                 }
             }
-            LogicalPlan::Scan { .. } => {
-                // Full scan implementation
-                for doc_id in 0..self.index.doc_count {
-                    collector.collect(ScoredDocument {
-                        doc_id: DocId(doc_id as u64),
-                        score: 0.5,
-                        document: None,
-                        explanation: None,
+        }
+        
+        Ok(0.0) // Term not found in document
+    }
+    
+    /// Score a boolean query (sum of term scores)
+    fn score_bool_query<S: Scorer>(
+        &self,
+        doc_id: DocId,
+        bool_query: &BoolQuery,
+        index: &InvertedIndex,
+        scorer: &S,
+        stats: &IndexStatistics,
+    ) -> Result<f32> {
+        let mut total_score = 0.0;
+        
+        // Score must clauses
+        for must_clause in &bool_query.must {
+            total_score += self.calculate_score(doc_id, must_clause, index, scorer, stats)?;
+        }
+        
+        // Score should clauses
+        for should_clause in &bool_query.should {
+            total_score += self.calculate_score(doc_id, should_clause, index, scorer, stats)?;
+        }
+        
+        // Apply boost
+        Ok(total_score * bool_query.boost.unwrap_or(1.0))
+    }
+    
+    /// Generate detailed score explanation
+    fn generate_score_explanation(
+        &self,
+        doc_id: DocId,
+        query: &Query,
+        score: f32,
+        index: &InvertedIndex,
+    ) -> Result<ScoreExplanation> {
+        let mut details = Vec::new();
+        
+        match query {
+            Query::Term(tq) => {
+                let term = Term::new(&tq.value);
+                if let Some(term_info) = index.dictionary.get_term_info(&term) {
+                    details.push(ScoreExplanation {
+                        value: term_info.idf,
+                        description: format!("IDF for term '{}'", tq.value),
+                        details: Vec::new(),
                     });
                 }
             }
-            LogicalPlan::Intersection { inputs } => {
-                // Execute each input and intersect results
-                let mut result_sets: Vec<HashSet<DocId>> = Vec::new();
-
-                for input in inputs {
-                    let results = self.execute_plan(input, usize::MAX)?;
-                    let doc_ids: HashSet<DocId> = results.hits
-                        .into_iter()
-                        .map(|h| h.doc_id)
-                        .collect();
-                    result_sets.push(doc_ids);
-                }
-
-                // Find intersection
-                if let Some(first) = result_sets.first() {
-                    let mut intersection = first.clone();
-                    for set in result_sets.iter().skip(1) {
-                        intersection.retain(|id| set.contains(id));
-                    }
-
-                    for doc_id in intersection {
-                        collector.collect(ScoredDocument {
-                            doc_id,
-                            score: 1.0,
-                            document: None,
-                            explanation: None,
-                        });
-                    }
-                }
-            }
-            _ => {
-                // Other plan types...
-            }
+            _ => {}
         }
-
-        let total_collected = collector.total_collected;
-        let max_score = collector.max_score();
-        let hits = collector.get_results();
-
-        Ok(SearchResults {
-            hits,
-            total_hits: total_collected,
-            max_score,
-            took_ms: start.elapsed().as_millis() as u64,
+        
+        Ok(ScoreExplanation {
+            value: score,
+            description: format!("BM25 score for document {}", doc_id.0),
+            details,
         })
+    }
+
+}
+
+impl Default for QueryExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_execution_config() {
+        // Default uses BM25
+        let config = ExecutionConfig::default();
+        assert_eq!(config.scoring, ScoringAlgorithm::BM25);
+        assert!(config.enable_optimization);
+        assert!(config.enable_validation);
+        assert!(!config.collect_explanations);
+        
+        // Simple uses no scoring
+        let simple = ExecutionConfig::simple();
+        assert_eq!(simple.scoring, ScoringAlgorithm::None);
+        assert!(!simple.enable_optimization);
+        assert!(!simple.enable_validation);
+        
+        // Debug uses BM25 with explanations
+        let debug = ExecutionConfig::debug();
+        assert_eq!(debug.scoring, ScoringAlgorithm::BM25);
+        assert!(debug.collect_explanations);
+        
+        // TF-IDF config
+        let tfidf = ExecutionConfig::tfidf();
+        assert_eq!(tfidf.scoring, ScoringAlgorithm::TfIdf);
+        
+        // BM25 config
+        let bm25 = ExecutionConfig::bm25();
+        assert_eq!(bm25.scoring, ScoringAlgorithm::BM25);
     }
 }

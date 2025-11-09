@@ -7,6 +7,7 @@ use crate::core::utils::levenshtein_distance;
 use crate::index::inverted::{InvertedIndex, Term};
 use crate::search::results::ScoredDocument;
 use crate::storage::segment_reader::SegmentReader;
+use crate::storage::segment::SegmentHeader;
 
 /// Document matcher - implements query matching logic
 /// This is the search functionality that M02 didn't have
@@ -25,53 +26,31 @@ impl DocumentMatcher {
     pub fn matches(&self, doc: &Document, query: &Query) -> Result<bool> {
         match query {
             Query::MatchAll => Ok(true),
-
-            Query::Term(term_query) => {
-                Ok(self.matches_term(doc, term_query))
-            },
-
-            Query::Phrase(phrase_query) => {
-                Ok(self.matches_phrase(doc, phrase_query))
-            },
-
-            Query::Bool(bool_query) => {
-                self.matches_bool(doc, bool_query)
-            },
-
-            Query::Range(range_query) => {
-                Ok(self.matches_range(doc, range_query))
-            },
-
-            Query::Prefix(prefix_query) => {
-                Ok(self.matches_prefix(doc, prefix_query))
-            },
-
-            Query::Wildcard(wildcard_query) => {
-                Ok(self.matches_wildcard(doc, wildcard_query))
-            },
-
-            Query::Fuzzy(fuzzy_query) => {
-                Ok(self.matches_fuzzy(doc, fuzzy_query))
-            },
+            Query::Term(term_query) => self.matches_term(doc, term_query),
+            Query::Phrase(phrase_query) => self.matches_phrase(doc, phrase_query),
+            Query::Bool(bool_query) => self.matches_bool(doc, bool_query),
+            Query::Range(range_query) => self.matches_range(doc, range_query),
+            Query::Prefix(prefix_query) => self.matches_prefix(doc, prefix_query),
+            Query::Wildcard(wildcard_query) => self.matches_wildcard(doc, wildcard_query),
+            Query::Fuzzy(fuzzy_query) => self.matches_fuzzy(doc, fuzzy_query),
         }
     }
-
     /// Match term query - field-specific search
-    fn matches_term(&self, doc: &Document, term_query: &TermQuery) -> bool {
+    fn matches_term(&self, doc: &Document, term_query: &TermQuery) -> Result<bool> {
         let field = &term_query.field;
         let value = &term_query.value;
 
         // Special field "_all" searches all text fields
         if field == "_all" {
-            return self.doc_contains_text(doc, value);
+            return Ok(self.doc_contains_text(doc, value));
         }
 
         // Field-specific search
-        self.field_contains_text(doc, field, value)
+        Ok(self.field_contains_text(doc, field, value))
     }
 
     /// Match phrase query - proximity search with slop
-    fn matches_phrase(&self, doc: &Document, phrase_query: &PhraseQuery) -> bool {
+    fn matches_phrase(&self, doc: &Document, phrase_query: &PhraseQuery) -> Result<bool> {
         let field = &phrase_query.field;
         let phrase = &phrase_query.phrase;
         let slop = phrase_query.slop;
@@ -88,7 +67,7 @@ impl DocumentMatcher {
             if let Some(posting_list) = self.index.search_term(&term) {
                 // Find posting for this specific document
                 let mut found = false;
-                for posting in &posting_list.postings {
+                for posting in &posting_list.iter()? {
                     if posting.doc_id == doc.id {
                         term_positions.push(posting.positions.clone());
                         found = true;
@@ -98,11 +77,11 @@ impl DocumentMatcher {
 
                 if !found {
                     // Term not found in this document
-                    return false;
+                    return Ok(false);
                 }
             } else {
                 // Term not in index at all
-                return false;
+                return Ok(false);
             }
         }
 
@@ -110,11 +89,147 @@ impl DocumentMatcher {
         if slop == 0 {
             // Exact phrase: terms must be adjacent
             // E.g., "hello world" requires pos(world) == pos(hello) + 1
-            self.check_adjacent_positions(&term_positions)
+            Ok(self.check_adjacent_positions(&term_positions))
         } else {
             // Proximity match: allow gaps up to slop
             // E.g., "hello world"~2 allows up to 2 words between hello and world
-            self.check_proximity_positions(&term_positions, slop)
+            Ok(self.check_proximity_positions(&term_positions, slop))
+        }
+    }
+
+    /// Match boolean query
+    fn matches_bool(&self, doc: &Document, bool_query: &BoolQuery) -> Result<bool> {
+        // Must clauses: all must match (AND)
+        for must_clause in &bool_query.must {
+            if !self.matches(doc, must_clause)? {
+                return Ok(false);
+            }
+        }
+
+        // Must not clauses: none must match (NOT)
+        for must_not_clause in &bool_query.must_not {
+            if self.matches(doc, must_not_clause)? {
+                return Ok(false);
+            }
+        }
+
+        // Should clauses: at least one must match (OR)
+        if !bool_query.should.is_empty() {
+            let mut any_match = false;
+            for should_clause in &bool_query.should {
+                if self.matches(doc, should_clause)? {
+                    any_match = true;
+                    break;
+                }
+            }
+            if !any_match {
+                return Ok(false);
+            }
+        }
+
+        // Filter clauses: must match but don't affect score
+        for filter_clause in &bool_query.filter {
+            if !self.matches(doc, filter_clause)? {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Match range query
+    fn matches_range(&self, doc: &Document, range_query: &RangeQuery) -> Result<bool> {
+        if let Some(field_value) = doc.fields.get(&range_query.field) {
+            match field_value {
+                FieldValue::Number(num) => {
+                    Ok(self.number_in_range(*num, range_query))
+                },
+                FieldValue::Date(date) => {
+                    // Date range matching
+                    // Implementation depends on range_query having date values
+                    Ok(true)  // Placeholder
+                },
+                _ => Ok(false),
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn matches_prefix(&self, doc: &Document, query: &PrefixQuery) -> Result<bool> {
+        if let Some(field_value) = doc.fields.get(&query.field) {
+            match field_value {
+                FieldValue::Text(text) => {
+                    // Check if text starts with prefix
+                    // For multi-word fields, check if any word starts with prefix
+                    let words: Vec<&str> = text.split_whitespace().collect();
+                    for word in words {
+                        if word.starts_with(&query.prefix) {
+                            return Ok(true);
+                        }
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(false)
+    }
+
+    fn matches_wildcard(&self, doc: &Document, query: &WildcardQuery) -> Result<bool> {
+        // Get field value from document
+        if let Some(field_value) = doc.fields.get(&query.field) {
+            match field_value {
+                FieldValue::Text(text) => {
+                    // Convert wildcard pattern to regex
+                    // * -> .*, ? -> .
+                    let pattern = query.pattern
+                        .replace("*", ".*")
+                        .replace("?", ".");
+
+                    if let Ok(regex) = Regex::new(&pattern) {
+                        return Ok(regex.is_match(text));
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(false)
+    }
+
+    fn matches_fuzzy(&self, doc: &Document, query: &FuzzyQuery) -> Result<bool> {
+        // Get field value from document
+        if let Some(field_value) = doc.fields.get(&query.field) {
+            match field_value {
+                FieldValue::Text(text) => {
+                    let max_edits = query.max_edits.unwrap_or(2) as usize;
+                    let query_term_lower = query.term.to_lowercase();
+                    
+                    // FIX: Tokenize text into words and compare each word
+                    // Instead of comparing entire field text (wrong!)
+                    let words: Vec<&str> = text
+                        .split_whitespace()
+                        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+                        .filter(|w| !w.is_empty())
+                        .collect();
+                    
+                    // Compare query term with EACH word
+                    for word in words {
+                        let word_lower = word.to_lowercase();
+                        let distance = levenshtein_distance(&query_term_lower, &word_lower);
+                        
+                        // Match if ANY word has distance <= max_edits
+                        if distance <= max_edits {
+                            return Ok(true);
+                        }
+                    }
+                    
+                    // No word matches
+                    Ok(false)
+                }
+                _ => Ok(false),
+            }
+        } else {
+            Ok(false)
         }
     }
 
@@ -181,65 +296,6 @@ impl DocumentMatcher {
         false
     }
 
-    /// Match boolean query
-    fn matches_bool(&self, doc: &Document, bool_query: &BoolQuery) -> Result<bool> {
-        // Must clauses: all must match (AND)
-        for must_clause in &bool_query.must {
-            if !self.matches(doc, must_clause)? {
-                return Ok(false);
-            }
-        }
-
-        // Must not clauses: none must match (NOT)
-        for must_not_clause in &bool_query.must_not {
-            if self.matches(doc, must_not_clause)? {
-                return Ok(false);
-            }
-        }
-
-        // Should clauses: at least one must match (OR)
-        if !bool_query.should.is_empty() {
-            let mut any_match = false;
-            for should_clause in &bool_query.should {
-                if self.matches(doc, should_clause)? {
-                    any_match = true;
-                    break;
-                }
-            }
-            if !any_match {
-                return Ok(false);
-            }
-        }
-
-        // Filter clauses: must match but don't affect score
-        for filter_clause in &bool_query.filter {
-            if !self.matches(doc, filter_clause)? {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    }
-
-    /// Match range query
-    fn matches_range(&self, doc: &Document, range_query: &RangeQuery) -> bool {
-        if let Some(field_value) = doc.fields.get(&range_query.field) {
-            match field_value {
-                FieldValue::Number(num) => {
-                    self.number_in_range(*num, range_query)
-                },
-                FieldValue::Date(date) => {
-                    // Date range matching
-                    // Implementation depends on range_query having date values
-                    true  // Placeholder
-                },
-                _ => false,
-            }
-        } else {
-            false
-        }
-    }
-
     fn number_in_range(&self, num: f64, range_query: &RangeQuery) -> bool {
         // Check gt/gte
         if let Some(FieldValue::Number(gt)) = &range_query.gt {
@@ -292,85 +348,45 @@ impl DocumentMatcher {
 
         false
     }
-
-    fn matches_prefix(&self, doc: &Document, query: &PrefixQuery) -> bool {
-        if let Some(field_value) = doc.fields.get(&query.field) {
-            match field_value {
-                FieldValue::Text(text) => {
-                    // Check if text starts with prefix
-                    // For multi-word fields, check if any word starts with prefix
-                    let words: Vec<&str> = text.split_whitespace().collect();
-                    for word in words {
-                        if word.starts_with(&query.prefix) {
-                            return true;
-                        }
-                    }
-                }
-                _ => return false,
-            }
-        }
-        false
-    }
-
-    fn matches_wildcard(&self, doc: &Document, query: &WildcardQuery) -> bool {
-        // Get field value from document
-        if let Some(field_value) = doc.fields.get(&query.field) {
-            match field_value {
-                FieldValue::Text(text) => {
-                    // Convert wildcard pattern to regex
-                    // * -> .*, ? -> .
-                    let pattern = query.pattern
-                        .replace("*", ".*")
-                        .replace("?", ".");
-
-                    if let Ok(regex) = Regex::new(&pattern) {
-                        return regex.is_match(text);
-                    }
-                }
-                _ => return false,
-            }
-        }
-        false
-    }
-
-    fn matches_fuzzy(&self, doc: &Document, query: &FuzzyQuery) -> bool {
-        // Get field value from document
-        if let Some(field_value) = doc.fields.get(&query.field) {
-            return match field_value {
-                FieldValue::Text(text) => {
-                    // Calculate Levenshtein distance
-                    let max_edits = query.max_edits;
-                    let distance = levenshtein_distance(&query.term, text);
-                    distance <= max_edits.unwrap() as usize
-                }
-                _ => false,
-            }
-        }
-        false
-    }
-
 }
 
 /// Extension trait to add search to SegmentReader (from M02)
 pub trait SegmentSearch {
-    fn search(&mut self, query: &Query, matcher: &DocumentMatcher) -> Result<Vec<ScoredDocument>>;
+    fn search(&self, query: &Query, matcher: &DocumentMatcher) -> Result<Vec<ScoredDocument>>;
 }
 
 impl SegmentSearch for SegmentReader {
     /// Search documents in segment using query
     /// This is the search() method that M02 didn't have
-    fn search(&mut self, query: &Query, matcher: &DocumentMatcher) -> Result<Vec<ScoredDocument>> {
+    fn search(&self, query: &Query, matcher: &DocumentMatcher) -> Result<Vec<ScoredDocument>> {
+        use std::io::{Read, Seek, SeekFrom};
         let mut results = Vec::new();
-
-        // Use M02's read_all_documents()
-        let docs = self.read_all_documents()?;
-
-        for doc in docs {
-            // Apply query matching (M05's logic)
+        
+        // Use lazy iteration pattern directly here
+        let mut file = self.file.lock().unwrap();
+        
+        // Seek to start of documents (after header)
+        file.seek(SeekFrom::Start(SegmentHeader::SIZE as u64))?;
+        
+        // Iterate through documents one by one
+        for _ in 0..self.header.doc_count {
+            // Read document length
+            let mut len_buf = [0u8; 4];
+            if file.read_exact(&mut len_buf).is_err() {
+                break; // EOF
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            
+            // Read document data
+            let mut doc_buf = vec![0u8; len];
+            file.read_exact(&mut doc_buf)?;
+            let doc: Document = bincode::deserialize(&doc_buf)?;
+            
+            // Apply query matching
             if matcher.matches(&doc, query)? {
                 results.push(ScoredDocument {
                     doc_id: doc.id,
-                    score: 1.0,  // Simple scoring for now, real scoring uses M04's BM25
+                    score: 1.0,  // Simple scoring for now
                     document: Some(doc),
                     explanation: None,
                 });

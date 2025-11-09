@@ -1,9 +1,5 @@
 use serde::{Serialize, Deserialize};
-use chrono::{DateTime, Utc};
 use crate::core::types::FieldValue;
-use crate::index::inverted::InvertedIndex;
-use crate::search::fuzzy::FuzzyAutomaton;
-use crate::search::prefix::PrefixIndex;
 
 /// Main query enum representing all query types
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

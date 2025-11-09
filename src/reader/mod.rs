@@ -1,2 +1,3 @@
 pub mod reader_pool;
-mod snapshot_reader;
+pub mod snapshot_reader;
+pub mod lazy;

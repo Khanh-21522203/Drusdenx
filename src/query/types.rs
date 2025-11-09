@@ -35,11 +35,13 @@ impl IndexStatistics {
         let total_docs = index.doc_count;
         let total_terms = index.dictionary.len();
 
-        // Calculate average document length
+        // Calculate average document length (sum of all term frequencies)
         let mut total_length = 0;
         for posting_list in index.postings.values() {
-            for posting in &posting_list.postings {
-                total_length += posting.positions.len();
+            if let Ok(postings) = posting_list.iter() {
+                for posting in postings {
+                    total_length += posting.term_freq;
+                }
             }
         }
         let avg_doc_length = if total_docs > 0 {

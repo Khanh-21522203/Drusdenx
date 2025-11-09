@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-use rust_stemmers::{Algorithm, Stemmer};
 use crate::analysis::token::Token;
 
 pub trait TokenFilter: Send + Sync {

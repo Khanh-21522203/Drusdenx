@@ -3,6 +3,14 @@ name = "Drusdenx"
 version = "0.1.0"
 edition = "2024"
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+
+[[bench]]
+name = "database_benchmark"
+harness = false
+
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.47.1", features = ["full"] }
@@ -27,3 +35,8 @@ crossbeam = "0.8.4"
 levenshtein_automata = "0.2.1"
 lz4 = "1.28.1"
 regex = "1.12.2"
+zstd = "0.13.3"
+snap = "1.1.1"
+rayon = "1.11.0"
+num_cpus = "1.17.0"
+tempfile = "3.23.0"

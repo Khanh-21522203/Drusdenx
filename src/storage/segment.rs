@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use crate::core::types::DocId;
 
 /// Unique segment identifier
@@ -10,6 +11,12 @@ pub struct SegmentId(pub Uuid);
 impl SegmentId {
     pub fn new() -> Self {
         SegmentId(Uuid::new_v4())
+    }
+}
+
+impl fmt::Display for SegmentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 

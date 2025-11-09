@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use crate::query::ast::Query;
 use crate::query::types::{IndexStatistics, SortOrder};
 

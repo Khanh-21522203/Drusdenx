@@ -52,7 +52,7 @@ pub struct Transaction {
     pub isolation_level: IsolationLevel,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationLevel {
     ReadCommitted,
     RepeatableRead,
@@ -70,14 +70,28 @@ impl MVCCController {
     }
 
     pub fn create_snapshot(&self, segments: Vec<Arc<Segment>>) -> Arc<Snapshot> {
+        self.create_snapshot_with_deletes(segments, Arc::new(RoaringBitmap::new()))
+    }
+    
+    /// Create snapshot with specific deleted docs bitmap
+    pub fn create_snapshot_with_deletes(
+        &self, 
+        segments: Vec<Arc<Segment>>, 
+        deleted_docs: Arc<RoaringBitmap>
+    ) -> Arc<Snapshot> {
         let version = self.current_version.fetch_add(1, Ordering::SeqCst);
+        
+        // Calculate total doc count
+        let doc_count = segments.iter()
+            .map(|s| s.doc_count as usize)
+            .sum();
 
         let snapshot = Arc::new(Snapshot {
             version,
             segments,
             timestamp: Utc::now(),
-            doc_count: 0,
-            deleted_docs: Arc::new(RoaringBitmap::new()),
+            doc_count,
+            deleted_docs,
         });
 
         let mut versions = self.versions.write();
