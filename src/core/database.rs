@@ -10,6 +10,7 @@ use crate::core::error::Result;
 use crate::index::inverted::{InvertedIndex};
 use crate::memory::buffer_pool::BufferPool;
 use crate::memory::pool::MemoryPool;
+use crate::memory::low_memory::{LowMemoryMode, LowMemoryConfig};
 use crate::mvcc::controller::MVCCController;
 use crate::parallel::indexer::ParallelIndexer;
 use crate::query::cache::QueryCache;
@@ -49,6 +50,9 @@ pub struct Database {
     
     // Transaction support
     pub(crate) transaction_manager: Option<Arc<TransactionManager>>,
+    
+    // Low memory mode support
+    pub(crate) low_memory_mode: Option<Arc<RwLock<LowMemoryMode>>>,
 }
 
 impl Database {
@@ -145,6 +149,7 @@ impl Database {
             last_flush_time: Arc::new(RwLock::new(None)),
             last_commit_time: Arc::new(RwLock::new(None)),
             transaction_manager: None, // Will be set after database is created
+            low_memory_mode: None, // Will be enabled if needed
         };
         
         Ok(db)
@@ -152,12 +157,45 @@ impl Database {
 
     pub fn add_document(&self, doc: Document) -> Result<()> {
         self.write_count.fetch_add(1, Ordering::Relaxed);
+        
+        // Estimate document size (rough estimate: fields + overhead)
+        let doc_size = doc.fields.iter()
+            .map(|(k, v)| k.len() + match v {
+                crate::core::types::FieldValue::Text(s) => s.len(),
+                crate::core::types::FieldValue::Number(_) => 8,
+                crate::core::types::FieldValue::Date(_) => 8,
+                crate::core::types::FieldValue::Boolean(_) => 1,
+            })
+            .sum::<usize>() + 100; // 100 bytes overhead per document
+        
+        // Track memory allocation if low memory mode is enabled
+        if let Some(low_mem) = &self.low_memory_mode {
+            let lm = low_mem.read();
+            let _ = lm.memory_tracker.allocate(doc_size);
+        }
+        
+        // Check memory pressure and reclaim if needed
+        if let Some(pressure) = self.get_memory_pressure() {
+            if pressure > 0.8 {
+                // Trigger memory reclamation in background (non-blocking)
+                self.maybe_reclaim_memory()?;
+            }
+        }
+        
         self.writer.write().add_document(doc)
     }
     
     /// Delete a document by ID (soft delete - marks as deleted)
     pub fn delete_document(&self, doc_id: DocId) -> Result<()> {
         self.write_count.fetch_add(1, Ordering::Relaxed);
+        
+        // Deallocate memory if low memory mode is enabled
+        // Estimate: average document size (rough estimate)
+        if let Some(low_mem) = &self.low_memory_mode {
+            let lm = low_mem.read();
+            lm.memory_tracker.deallocate(500); // Average doc size estimate
+        }
+        
         self.writer.write().delete_document(doc_id)
     }
     
@@ -313,6 +351,38 @@ impl Database {
         self.commit()?;
         
         println!("WAL recovery completed: {} operations recovered", recovered_count);
+        Ok(())
+    }
+    
+    /// Enable low memory mode with custom configuration
+    pub fn enable_low_memory_mode(&mut self, config: LowMemoryConfig) {
+        let low_mem = LowMemoryMode::new(config);
+        self.low_memory_mode = Some(Arc::new(RwLock::new(low_mem)));
+    }
+    
+    /// Enable low memory mode with default configuration
+    pub fn enable_low_memory_mode_default(&mut self) {
+        self.enable_low_memory_mode(LowMemoryConfig::default());
+    }
+    
+    /// Check if low memory mode is enabled
+    pub fn is_low_memory_mode_enabled(&self) -> bool {
+        self.low_memory_mode.is_some()
+    }
+    
+    /// Get current memory pressure (0.0 to 1.0)
+    pub fn get_memory_pressure(&self) -> Option<f32> {
+        self.low_memory_mode.as_ref().map(|lm| {
+            lm.read().memory_pressure()
+        })
+    }
+    
+    /// Trigger memory reclamation if needed (should be called periodically)
+    pub fn maybe_reclaim_memory(&self) -> Result<()> {
+        if let Some(low_mem) = &self.low_memory_mode {
+            let mut lm = low_mem.write();
+            lm.maybe_reclaim()?;
+        }
         Ok(())
     }
     
@@ -494,6 +564,24 @@ impl Database {
             message: None,
             latency_ms: disk_check_start.elapsed().as_millis() as u64,
         });
+        
+        // Check 5: Memory pressure (if low memory mode enabled)
+        let memory_check_start = Instant::now();
+        if let Some(pressure) = self.get_memory_pressure() {
+            let memory_status = if pressure > 0.9 {
+                HealthStatus::Unhealthy(format!("Memory pressure critical: {:.1}%", pressure * 100.0))
+            } else if pressure > 0.8 {
+                HealthStatus::Degraded(format!("Memory pressure high: {:.1}%", pressure * 100.0))
+            } else {
+                HealthStatus::Healthy
+            };
+            checks.push(HealthCheck {
+                name: "Memory".to_string(),
+                status: memory_status,
+                message: Some(format!("Pressure: {:.1}%", pressure * 100.0)),
+                latency_ms: memory_check_start.elapsed().as_millis() as u64,
+            });
+        }
         
         // Overall status
         let overall_status = if checks.iter().all(|c| c.status == HealthStatus::Healthy) {
