@@ -5,6 +5,7 @@ use crate::core::error::{Error, ErrorKind, Result};
 use crate::core::types::{DocId, Document};
 use crate::storage::layout::StorageLayout;
 use crate::storage::segment::{SegmentHeader, SegmentId};
+use crate::compression::compress::CompressedBlock;
 
 pub struct SegmentReader {
     pub segment_id: SegmentId,
@@ -22,12 +23,11 @@ pub struct DocumentIterator<'a> {
 impl SegmentReader {
     pub fn open(storage: &StorageLayout, segment_id: SegmentId) -> Result<Self> {
         let path = storage.segment_path(&segment_id);
-        let mut file = File::open(path)?;
+        let mut file = File::open(&path)?;
 
-        // Read header
-        let mut header_buf = vec![0u8; SegmentHeader::SIZE];
-        file.read_exact(&mut header_buf)?;
-        let header: SegmentHeader = bincode::deserialize(&header_buf)?;
+        // Read header using bincode directly (variable length)
+        let header: SegmentHeader = bincode::deserialize_from(&mut file)
+            .map_err(|e| Error::new(ErrorKind::Parse, format!("Failed to read header: {}", e)))?;
 
         // Verify version
         if header.version != SegmentHeader::VERSION {
@@ -65,17 +65,23 @@ impl SegmentReader {
     fn read_next_document(&mut self) -> Result<Option<Document>> {
         let mut file = self.file.lock().unwrap();
         
-        // Read length
+        // Read length (serialized CompressedBlock size)
         let mut len_buf = [0u8; 4];
         if file.read_exact(&mut len_buf).is_err() {
             return Ok(None); // EOF
         }
         let len = u32::from_le_bytes(len_buf) as usize;
 
-        // Read document
-        let mut doc_buf = vec![0u8; len];
-        file.read_exact(&mut doc_buf)?;
-        let doc: Document = bincode::deserialize(&doc_buf)?;
+        // Read serialized CompressedBlock
+        let mut block_buf = vec![0u8; len];
+        file.read_exact(&mut block_buf)?;
+        
+        // Deserialize CompressedBlock (includes original_size metadata)
+        let compressed_block: CompressedBlock = bincode::deserialize(&block_buf)?;
+        let decompressed = compressed_block.decompress()?;
+        
+        // Deserialize document
+        let doc: Document = bincode::deserialize(&decompressed)?;
 
         Ok(Some(doc))
     }
@@ -89,15 +95,21 @@ impl SegmentReader {
         file.seek(SeekFrom::Start(SegmentHeader::SIZE as u64))?;
 
         for _ in 0..self.header.doc_count {
-            // Read length
+            // Read length (serialized CompressedBlock size)
             let mut len_buf = [0u8; 4];
             file.read_exact(&mut len_buf)?;
             let len = u32::from_le_bytes(len_buf) as usize;
 
-            // Read document
-            let mut doc_buf = vec![0u8; len];
-            file.read_exact(&mut doc_buf)?;
-            let doc: Document = bincode::deserialize(&doc_buf)?;
+            // Read serialized CompressedBlock
+            let mut block_buf = vec![0u8; len];
+            file.read_exact(&mut block_buf)?;
+            
+            // Deserialize CompressedBlock (includes original_size metadata)
+            let compressed_block: CompressedBlock = bincode::deserialize(&block_buf)?;
+            let decompressed = compressed_block.decompress()?;
+            
+            // Deserialize document
+            let doc: Document = bincode::deserialize(&decompressed)?;
 
             if doc.id == doc_id {
                 return Ok(Some(doc));

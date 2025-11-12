@@ -2,7 +2,7 @@ use std::sync::Arc;
 use regex::Regex;
 use crate::core::types::{Document, FieldValue};
 use crate::query::ast::{Query, TermQuery, PhraseQuery, BoolQuery, RangeQuery, PrefixQuery, FuzzyQuery, WildcardQuery};
-use crate::core::error::Result;
+use crate::core::error::{Result, Error, ErrorKind};
 use crate::core::utils::levenshtein_distance;
 use crate::index::inverted::{InvertedIndex, Term};
 use crate::search::results::ScoredDocument;
@@ -360,27 +360,39 @@ impl SegmentSearch for SegmentReader {
     /// This is the search() method that M02 didn't have
     fn search(&self, query: &Query, matcher: &DocumentMatcher) -> Result<Vec<ScoredDocument>> {
         use std::io::{Read, Seek, SeekFrom};
+        use crate::compression::compress::CompressedBlock;
         let mut results = Vec::new();
         
         // Use lazy iteration pattern directly here
         let mut file = self.file.lock().unwrap();
         
-        // Seek to start of documents (after header)
-        file.seek(SeekFrom::Start(SegmentHeader::SIZE as u64))?;
+        // Seek to start of documents (read header size to skip it)
+        // The file was positioned after header during open(), but we need to reposition
+        file.seek(SeekFrom::Start(0))?;
+        // Skip header by deserializing it (variable length)
+        let _: SegmentHeader = bincode::deserialize_from(&mut *file)?;
+        
+        // Now positioned right after header, ready to read documents
         
         // Iterate through documents one by one
         for _ in 0..self.header.doc_count {
-            // Read document length
+            // Read document length (serialized CompressedBlock size)
             let mut len_buf = [0u8; 4];
             if file.read_exact(&mut len_buf).is_err() {
                 break; // EOF
             }
             let len = u32::from_le_bytes(len_buf) as usize;
             
-            // Read document data
-            let mut doc_buf = vec![0u8; len];
-            file.read_exact(&mut doc_buf)?;
-            let doc: Document = bincode::deserialize(&doc_buf)?;
+            // Read serialized CompressedBlock
+            let mut block_buf = vec![0u8; len];
+            file.read_exact(&mut block_buf)?;
+            
+            // Deserialize CompressedBlock (includes original_size metadata)
+            let compressed_block: CompressedBlock = bincode::deserialize(&block_buf)?;
+            let decompressed = compressed_block.decompress()?;
+            
+            // Deserialize document
+            let doc: Document = bincode::deserialize(&decompressed)?;
             
             // Apply query matching
             if matcher.matches(&doc, query)? {

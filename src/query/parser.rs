@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use crate::core::error::{Error, ErrorKind, Result};
 use crate::core::types::FieldValue;
-use crate::query::ast::{BoolQuery, PhraseQuery, Query, RangeQuery, TermQuery};
+use crate::query::ast::{BoolQuery, PhraseQuery, Query, RangeQuery, TermQuery, FuzzyQuery, WildcardQuery};
 
 /// Query parser for converting string queries to AST
 #[derive(Clone)]
@@ -81,28 +81,34 @@ impl QueryParser {
             }));
         }
 
-        // // Check for fuzzy query
-        // if let Some(pos) = input.find('~') {
-        //     let term = &input[..pos];
-        //     let distance = input[pos + 1..].parse::<u8>().unwrap_or(2);
-        //     return Ok(Query::Fuzzy(FuzzyQuery {
-        //         field: self.default_field.clone(),
-        //         value: term.to_string(),
-        //         max_edits: distance.min(2),
-        //         prefix_length: 0,
-        //         transpositions: true,
-        //         boost: None,
-        //     }));
-        // }
-        //
-        // // Check for wildcard query
-        // if input.contains('*') || input.contains('?') {
-        //     return Ok(Query::Wildcard(WildcardQuery {
-        //         field: self.default_field.clone(),
-        //         pattern: input.to_string(),
-        //         boost: None,
-        //     }));
-        // }
+        // Check for fuzzy query (term~2 or term~)
+        if self.fuzzy_enabled && input.contains('~') {
+            if let Some(pos) = input.find('~') {
+                let term = &input[..pos];
+                let distance_str = &input[pos + 1..];
+                let distance = if distance_str.is_empty() {
+                    1  // Default distance
+                } else {
+                    distance_str.parse::<u8>().unwrap_or(2).min(2)
+                };
+                return Ok(Query::Fuzzy(FuzzyQuery {
+                    field: self.default_field.clone(),
+                    term: term.to_string(),
+                    max_edits: Some(distance),
+                    prefix_length: None,
+                    boost: None,
+                }));
+            }
+        }
+
+        // Check for wildcard query (term* or term?)
+        if self.allow_wildcards && (input.contains('*') || input.contains('?')) {
+            return Ok(Query::Wildcard(WildcardQuery {
+                field: self.default_field.clone(),
+                pattern: input.to_string(),
+                boost: None,
+            }));
+        }
 
         // Default to term query
         Ok(Query::Term(TermQuery {

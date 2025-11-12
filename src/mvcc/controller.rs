@@ -106,7 +106,12 @@ impl MVCCController {
     pub fn current_snapshot(&self) -> Arc<Snapshot> {
         let versions = self.versions.read();
         let current = self.current_version.load(Ordering::Acquire);
-        versions.get(&current)
+        
+        // fetch_add returns old value, so current snapshot is at (current - 1)
+        // unless current is 0 (no snapshots created yet)
+        let snapshot_version = if current > 0 { current - 1 } else { 0 };
+        
+        versions.get(&snapshot_version)
             .map(|s| Arc::new(s.clone()))
             .unwrap_or_else(|| Arc::new(Snapshot::default()))
     }

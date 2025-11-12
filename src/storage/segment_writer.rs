@@ -4,12 +4,15 @@ use chrono::Utc;
 use crc32fast::Hasher;
 use std::cmp;
 use std::sync::Arc;
+use std::collections::HashMap;
 use crate::compression::compress::{CompressedBlock, CompressionType};
 use crate::core::types::{DocId, Document};
 use crate::storage::layout::StorageLayout;
 use crate::storage::segment::{Segment, SegmentHeader, SegmentId, SegmentMetadata};
 use crate::core::error::Result;
 use crate::memory::buffer_pool::BufferPool;
+use crate::index::inverted::Term;
+use crate::index::posting::Posting;
 
 pub struct SegmentWriter {
     pub segment: Segment,
@@ -17,6 +20,7 @@ pub struct SegmentWriter {
     pub file: File,
     pub hasher: Hasher,
     pub buffer_pool: Arc<BufferPool>,
+    pub inverted_index: HashMap<Term, Vec<Posting>>,  // In-memory index buffer
 }
 
 impl SegmentWriter {
@@ -26,7 +30,13 @@ impl SegmentWriter {
         buffer_pool: Arc<BufferPool>
     ) -> Result<Self> {
         let path = storage.segment_path(&segment_id);
-        let file = File::create(path)?;
+        let mut file = File::create(path)?;
+        
+        // Write placeholder header to reserve space (will be updated in finish())
+        let placeholder_header = SegmentHeader::new(0);
+        let header_data = bincode::serialize(&placeholder_header)?;
+        file.write_all(&header_data)?;
+        file.flush()?;
 
         Ok(SegmentWriter {
             segment: Segment {
@@ -43,7 +53,16 @@ impl SegmentWriter {
             file,
             hasher: Hasher::new(),
             buffer_pool,
+            inverted_index: HashMap::new(),
         })
+    }
+    
+    /// Add inverted index entry
+    pub fn add_index_entry(&mut self, term: Term, posting: Posting) {
+        self.inverted_index
+            .entry(term)
+            .or_insert_with(Vec::new)
+            .push(posting);
     }
 
     /// Write document with compression (M08 optimization)
@@ -52,13 +71,17 @@ impl SegmentWriter {
         let data = bincode::serialize(doc)?;
 
         let compressed = CompressedBlock::compress(&data, CompressionType::LZ4)?;
+        
+        // Serialize the entire CompressedBlock (includes original_size metadata)
+        let compressed_block_data = bincode::serialize(&compressed)?;
 
-        let mut pooled_buffer = self.buffer_pool.get(compressed.data.len());
+        let mut pooled_buffer = self.buffer_pool.get(compressed_block_data.len());
+        pooled_buffer.clear(); // CRITICAL: Clear the pooled buffer before use!
 
-        // Write length prefix (compressed size)
-        let len = compressed.data.len() as u32;
+        // Write length prefix (serialized CompressedBlock size)
+        let len = compressed_block_data.len() as u32;
         pooled_buffer.extend_from_slice(&len.to_le_bytes());
-        pooled_buffer.extend_from_slice(&compressed.data);
+        pooled_buffer.extend_from_slice(&compressed_block_data);
 
         // Add to internal buffer
         let offset = self.buffer.len() as u64;
@@ -94,13 +117,16 @@ impl SegmentWriter {
     // [ DOCUMENT 1 ]
     // [ DOCUMENT 2 ]
     // [ DOCUMENT 3 ]
-    pub fn finish(mut self) -> Result<Segment> {
+    pub fn finish(mut self, storage: &StorageLayout) -> Result<Segment> {
         self.flush()?;
+
+        // Calculate checksum before consuming hasher
+        let checksum = self.hasher.clone().finalize();
 
         // Write header at the beginning
         self.file.seek(SeekFrom::Start(0))?;
         let mut header = SegmentHeader::new(self.segment.doc_count);
-        header.checksum = self.hasher.finalize();
+        header.checksum = checksum;
 
         let header_data = bincode::serialize(&header)?;
         self.file.write_all(&header_data)?;
@@ -109,7 +135,36 @@ impl SegmentWriter {
 
         // Update size
         self.segment.metadata.size_bytes = self.file.metadata()?.len() as usize;
+        
+        // Write inverted index to separate file (.idx)
+        if !self.inverted_index.is_empty() {
+            self.write_inverted_index(storage)?;
+        }
 
         Ok(self.segment)
+    }
+    
+    /// Write inverted index to disk (.idx file)
+    fn write_inverted_index(&self, storage: &StorageLayout) -> Result<()> {
+        // Create index file path in idx/ folder
+        let index_path = storage.index_path(&self.segment.id);
+        let mut index_file = File::create(index_path)?;
+        
+        // Sort postings by doc_id for each term
+        let mut sorted_index = self.inverted_index.clone();
+        for postings in sorted_index.values_mut() {
+            postings.sort_by_key(|p| p.doc_id);
+        }
+        
+        // Serialize and compress inverted index
+        let index_data = bincode::serialize(&sorted_index)?;
+        let compressed = CompressedBlock::compress(&index_data, CompressionType::LZ4)?;
+        
+        // Write the entire CompressedBlock (including metadata) to file
+        let compressed_block_data = bincode::serialize(&compressed)?;
+        index_file.write_all(&compressed_block_data)?;
+        index_file.sync_all()?;
+        
+        Ok(())
     }
 }

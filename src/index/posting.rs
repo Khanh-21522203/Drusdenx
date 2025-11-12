@@ -1,8 +1,9 @@
 use crate::compression::compress::{EncodedIntegerBlock, IntegerEncodingType};
 use crate::core::types::DocId;
 use crate::core::error::Result;
+use serde::{Serialize, Deserialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Posting {
     pub doc_id: DocId,
     pub term_freq: u32,       // Term frequency in document

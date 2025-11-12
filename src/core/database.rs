@@ -98,23 +98,26 @@ impl Database {
             });
 
 
-        let writer = Arc::new(RwLock::new(IndexWriter {
-            segment_writer,
-            wal,
+        // Create IndexWriter with configured merge policy
+        let merge_policy_type = config.merge_policy;
+        let mut index_writer = IndexWriter::new_with_merge_policy(
+            storage.clone(),
+            mvcc.clone(),
             memory_pool,
-            config: WriterConfig {
-                batch_size: config.writer_batch_size,
-                commit_interval: Duration::from_secs(config.writer_commit_interval_secs),
-                max_segment_size: config.writer_max_segment_size,
-            },
-            mvcc: mvcc.clone(),
-            lock: Arc::new(Mutex::new(())),
-            storage: storage.clone(),
-            buffer_pool: buffer_pool.clone(),
-            parallel_indexer: parallel_indexer.clone(),
+            buffer_pool.clone(),
+            parallel_indexer.clone(),
             analyzer,
-            merge_policy: Box::new(crate::storage::merge_policy::TieredMergePolicy::default()),
-        }));
+            merge_policy_type,
+        )?;
+        
+        // Override config
+        index_writer.config = WriterConfig {
+            batch_size: config.writer_batch_size,
+            commit_interval: Duration::from_secs(config.writer_commit_interval_secs),
+            max_segment_size: config.writer_max_segment_size,
+        };
+        
+        let writer = Arc::new(RwLock::new(index_writer));
 
         // Create shared QueryCache
         let cache_entries = config.cache_size / 1024; // Approximate entry count (1KB per result)

@@ -11,6 +11,10 @@ rand = "0.8"
 name = "database_benchmark"
 harness = false
 
+[[bench]]
+name = "index_loading_benchmark"
+harness = false
+
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.47.1", features = ["full"] }

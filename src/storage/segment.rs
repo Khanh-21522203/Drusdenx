@@ -54,7 +54,7 @@ pub enum CompressionType {
 
 impl SegmentHeader {
     pub const VERSION: u32 = 1;
-    pub const SIZE: usize = 24; // Fixed header size
+    pub const SIZE: usize = 24; // Fixed header size (not used with deserialize_from)
 
     pub fn new(doc_count: u32) -> Self {
         SegmentHeader {

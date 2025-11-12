@@ -7,6 +7,21 @@ use crate::reader::lazy::LazySegmentReader;
 use crate::core::error::Result;
 
 /// Streaming query processor for large result sets
+/// 
+/// TODO: Complete implementation for production streaming API
+/// Use cases:
+/// - Export millions of documents
+/// - Large pagination (page 1000+)
+/// - Streaming API responses  
+/// - ETL pipelines
+/// - Analytics queries
+/// 
+/// Required work:
+/// 1. Implement fetch_batch() with actual segment reading
+/// 2. Add search_with_offset() to SegmentReader
+/// 3. Support cursor-based pagination
+/// 4. Add memory pressure handling
+/// 5. Integrate with QueryExecutor for scoring
 #[derive(Clone)]
 pub struct StreamingProcessor {
     pub batch_size: usize,
@@ -91,7 +106,11 @@ impl StreamingResults {
     }
 
     fn fetch_batch(&self, cursor: &mut StreamingCursor) -> Result<Vec<Document>> {
-        // Implementation would fetch actual documents
+        // TODO: Implement actual batch fetching
+        // 1. Get reader from pool
+        // 2. Execute query with offset = cursor.position
+        // 3. Limit = cursor.batch_size
+        // 4. Return Vec<Document>
         Ok(Vec::new()) // Placeholder
     }
 }

@@ -13,8 +13,9 @@ use crate::memory::pool::MemoryPool;
 use crate::mvcc::controller::MVCCController;
 use crate::parallel::indexer::ParallelIndexer;
 use crate::storage::layout::StorageLayout;
-use crate::storage::merge_policy::{MergePolicy, TieredMergePolicy};
+use crate::storage::merge_policy::{MergePolicy, TieredMergePolicy, LogStructuredMergePolicy};
 use crate::storage::segment::Segment;
+use crate::core::config::MergePolicyType;
 
 /// Single writer with MVCC
 pub struct IndexWriter {
@@ -47,6 +48,26 @@ impl IndexWriter {
         parallel_indexer: Arc<ParallelIndexer>,
         analyzer: Arc<Analyzer>,
     ) -> Result<Self> {
+        Self::new_with_merge_policy(
+            storage,
+            mvcc,
+            memory_pool,
+            buffer_pool,
+            parallel_indexer,
+            analyzer,
+            MergePolicyType::Tiered,  // Default
+        )
+    }
+
+    pub fn new_with_merge_policy(
+        storage: Arc<StorageLayout>,
+        mvcc: Arc<MVCCController>,
+        memory_pool: MemoryPool,
+        buffer_pool: Arc<BufferPool>,
+        parallel_indexer: Arc<ParallelIndexer>,
+        analyzer: Arc<Analyzer>,
+        merge_policy_type: MergePolicyType,
+    ) -> Result<Self> {
         let segment_writer = SegmentWriter::new(
             &storage,
             SegmentId::new(),
@@ -54,6 +75,11 @@ impl IndexWriter {
         )?;
 
         let wal = WAL::open(&storage, 0)?;
+
+        let merge_policy: Box<dyn MergePolicy> = match merge_policy_type {
+            MergePolicyType::Tiered => Box::new(TieredMergePolicy::default()),
+            MergePolicyType::LogStructured => Box::new(LogStructuredMergePolicy::default()),
+        };
 
         Ok(IndexWriter {
             segment_writer,
@@ -66,18 +92,46 @@ impl IndexWriter {
             buffer_pool,
             parallel_indexer,
             analyzer,
-            merge_policy: Box::new(TieredMergePolicy::default()),
+            merge_policy,
         })
     }
     pub fn add_document(&mut self, doc: Document) -> Result<()> {
         // Hold lock for entire operation to prevent race conditions
         let _lock = self.lock.lock().unwrap();
 
+        // Index the document (tokenize and analyze)
+        let indexed_docs = self.parallel_indexer.index_batch(vec![doc.clone()], &self.analyzer)?;
+        
         // Write to WAL first
         self.wal.append(Operation::AddDocument(doc.clone()))?;
 
-        // Add to segment buffer
+        // Add to segment buffer (DATA)
         self.segment_writer.write_document(&doc)?;
+        
+        // Add to inverted index (INDEX)
+        if let Some(indexed_doc) = indexed_docs.first() {
+            // Create posting for this document
+            use crate::index::posting::Posting;
+            let mut term_positions: HashMap<_, Vec<usize>> = HashMap::new();
+            
+            for (pos, token) in indexed_doc.tokens.iter().enumerate() {
+                term_positions
+                    .entry(token.text.clone())
+                    .or_insert_with(Vec::new)
+                    .push(pos);
+            }
+            
+            for (term_text, positions) in term_positions {
+                let term = crate::index::inverted::Term::new(&term_text);
+                let posting = Posting {
+                    doc_id: doc.id,
+                    term_freq: positions.len() as u32,
+                    positions: positions.into_iter().map(|p| p as u32).collect(),
+                    field_norm: 1.0 / (indexed_doc.terms.len() as f32).sqrt(),
+                };
+                self.segment_writer.add_index_entry(term, posting);
+            }
+        }
 
         // Check if flush needed
         if self.segment_writer.segment.doc_count >= self.config.batch_size as u32 {
@@ -90,12 +144,15 @@ impl IndexWriter {
 
             // Replace old writer and finish it
             let old_writer = mem::replace(&mut self.segment_writer, new_writer);
-            let segment = old_writer.finish()?;
+            let segment = old_writer.finish(&self.storage)?;  // Pass storage reference
 
-            // Update MVCC snapshot
-            let mut segments = self.mvcc.current_snapshot().segments.clone();
-            segments.push(Arc::new(segment));
-            self.mvcc.create_snapshot(segments);
+            // Only add segment if it has documents
+            if segment.doc_count > 0 {
+                // Update MVCC snapshot
+                let mut segments = self.mvcc.current_snapshot().segments.clone();
+                segments.push(Arc::new(segment));
+                self.mvcc.create_snapshot(segments);
+            }
         }
         
         Ok(())
@@ -131,7 +188,7 @@ impl IndexWriter {
                             self.buffer_pool.clone()
                         )?;
                         let old_writer = mem::replace(&mut self.segment_writer, new_writer);
-                        let segment = old_writer.finish()?;
+                        let segment = old_writer.finish(&self.storage)?;
                         
                         let mut segments = self.mvcc.current_snapshot().segments.clone();
                         segments.push(Arc::new(segment));
@@ -168,18 +225,21 @@ impl IndexWriter {
 
         // Replace old writer and finish it
         let old_writer = mem::replace(&mut self.segment_writer, new_writer);
-        let segment = old_writer.finish()?;
+        let segment = old_writer.finish(&self.storage)?;
 
-        // Update MVCC snapshot
-        let mut segments = self.mvcc.current_snapshot().segments.clone();
-        segments.push(Arc::new(segment));
-        
-        // Check if we should merge segments
-        if self.merge_policy.should_merge(&segments) {
-            self.merge_segments_async(segments.clone());
+        // Only add segment if it has documents (skip empty segments)
+        if segment.doc_count > 0 {
+            // Update MVCC snapshot
+            let mut segments = self.mvcc.current_snapshot().segments.clone();
+            segments.push(Arc::new(segment));
+            
+            // Check if we should merge segments
+            if self.merge_policy.should_merge(&segments) {
+                self.merge_segments_async(segments.clone());
+            }
+            
+            self.mvcc.create_snapshot(segments);
         }
-        
-        self.mvcc.create_snapshot(segments);
 
         Ok(())
     }
@@ -237,7 +297,7 @@ impl IndexWriter {
             }
         }
         
-        let merged_segment = merged_writer.finish()?;
+        let merged_segment = merged_writer.finish(&storage)?;
         
         // Update snapshot with merged segment
         let current_snapshot = mvcc.current_snapshot();
@@ -333,7 +393,7 @@ impl IndexWriter {
                 }
             }
             
-            let new_segment = new_writer.finish()?;
+            let new_segment = new_writer.finish(&self.storage)?;
             new_segments.push(Arc::new(new_segment));
         }
         

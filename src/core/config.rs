@@ -1,6 +1,15 @@
 use std::path::PathBuf;
 use crate::compression::compress::CompressionType;
 
+/// Merge policy type selection
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergePolicyType {
+    /// Tiered merge policy (balanced read/write, default)
+    Tiered,
+    /// Log-structured merge policy (optimized for write-heavy workloads)
+    LogStructured,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub storage_path: PathBuf,
@@ -15,6 +24,7 @@ pub struct Config {
     pub buffer_pool_size: Option<usize>,     // Default: 100MB
     pub indexing_threads: Option<usize>,     // Default: num_cpus
     pub compression: CompressionType,
+    pub merge_policy: MergePolicyType,       // Merge policy selection
 }
 
 impl Default for Config {
@@ -31,6 +41,7 @@ impl Default for Config {
             buffer_pool_size: Some(100 * 1024 * 1024),
             indexing_threads: None,  // Will use num_cpus
             compression: CompressionType::LZ4,
+            merge_policy: MergePolicyType::Tiered,  // Default to balanced policy
         }
     }
 }

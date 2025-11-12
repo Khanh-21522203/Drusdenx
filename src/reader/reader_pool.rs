@@ -98,15 +98,22 @@ impl ReaderPool {
             let segment_reader = if let Some(cached) = cached_segment {
                 cached
             } else {
-                // Create new segment reader
-                let reader = SegmentReader::open(&self.storage, segment.id)?;
-                let reader_arc = Arc::new(RwLock::new(reader));
-                
-                // Cache it
-                let mut cache = self.segment_reader_cache.write();
-                cache.insert(cache_key, reader_arc.clone());
-                
-                reader_arc
+                // Create new segment reader, skip if it fails (e.g., empty segment)
+                match SegmentReader::open(&self.storage, segment.id) {
+                    Ok(reader) => {
+                        let reader_arc = Arc::new(RwLock::new(reader));
+                        
+                        // Cache it
+                        let mut cache = self.segment_reader_cache.write();
+                        cache.insert(cache_key, reader_arc.clone());
+                        
+                        reader_arc
+                    }
+                    Err(_e) => {
+                        // Skip segments that can't be opened (e.g., empty segments)
+                        continue;
+                    }
+                }
             };
             
             segment_readers.push(segment_reader);

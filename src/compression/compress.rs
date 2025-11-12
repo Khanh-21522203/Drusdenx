@@ -1,15 +1,17 @@
 use crate::compression::delta::DeltaEncoder;
 use crate::compression::vbyte::VByteEncoder;
 use crate::core::error::{Error, ErrorKind, Result};
+use serde::{Serialize, Deserialize};
 
 /// Compressed block storage for general purpose data
+#[derive(Serialize, Deserialize)]
 pub struct CompressedBlock {
     pub data: Vec<u8>,
     pub original_size: usize,
     pub compression: CompressionType,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum CompressionType {
     None,
     LZ4,      // Fast compression (~500 MB/s), ratio 2-3x
