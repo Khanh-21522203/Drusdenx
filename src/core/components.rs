@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use std::time::Duration;
-use parking_lot::{Mutex, RwLock};
 use crate::analysis::analyzer::{Analyzer, AnalyzerRegistry};
 use crate::core::config::Config;
 use crate::core::error::Result;
@@ -17,6 +14,9 @@ use crate::schema::schema::SchemaWithAnalyzer;
 use crate::search::executor::QueryExecutor;
 use crate::storage::layout::StorageLayout;
 use crate::writer::index_writer::{IndexWriter, WriterConfig};
+use parking_lot::{Mutex, RwLock};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// All assembled engine components.
 /// This is the single authoritative place that knows the assembly ordering.
@@ -47,7 +47,7 @@ impl EngineComponents {
 
         // Memory subsystem
         let buffer_pool = Arc::new(BufferPool::new(
-            config.buffer_pool_size.unwrap_or(100 * 1024 * 1024)
+            config.buffer_pool_size.unwrap_or(100 * 1024 * 1024),
         ));
 
         let block_size = 4 * 1024 * 1024;
@@ -56,7 +56,7 @@ impl EngineComponents {
 
         // Parallel indexer
         let parallel_indexer = Arc::new(ParallelIndexer::new(
-            config.indexing_threads.unwrap_or_else(|| num_cpus::get())
+            config.indexing_threads.unwrap_or_else(|| num_cpus::get()),
         ));
 
         // Analyzer
@@ -75,12 +75,14 @@ impl EngineComponents {
             parallel_indexer.clone(),
             analyzer,
             merge_policy_type,
+            config.compression,
         )?;
 
         index_writer.config = WriterConfig {
             batch_size: config.writer_batch_size,
             commit_interval: Duration::from_secs(config.writer_commit_interval_secs),
             max_segment_size: config.writer_max_segment_size,
+            compression: config.compression,
         };
 
         let writer = Arc::new(RwLock::new(index_writer));

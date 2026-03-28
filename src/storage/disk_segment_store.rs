@@ -1,14 +1,15 @@
-use std::sync::Arc;
+use crate::compression::compress::CompressionType;
 use crate::core::error::Result;
 use crate::core::types::Document;
 use crate::index::inverted::Term;
 use crate::index::posting::Posting;
+use crate::memory::buffer_pool::BufferPool;
 use crate::storage::layout::StorageLayout;
 use crate::storage::segment::{Segment, SegmentId};
 use crate::storage::segment_reader::SegmentReader;
 use crate::storage::segment_writer::SegmentWriter;
-use crate::memory::buffer_pool::BufferPool;
 use crate::writer::segment_store::{SegmentSink, SegmentStore};
+use std::sync::Arc;
 
 /// Production segment store backed by real disk files.
 pub struct DiskSegmentStore {
@@ -18,7 +19,10 @@ pub struct DiskSegmentStore {
 
 impl DiskSegmentStore {
     pub fn new(storage: Arc<StorageLayout>, buffer_pool: Arc<BufferPool>) -> Self {
-        DiskSegmentStore { storage, buffer_pool }
+        DiskSegmentStore {
+            storage,
+            buffer_pool,
+        }
     }
 }
 
@@ -28,6 +32,7 @@ impl SegmentStore for DiskSegmentStore {
             &self.storage,
             SegmentId::new(),
             self.buffer_pool.clone(),
+            CompressionType::LZ4,
         )?;
         Ok(Box::new(DiskSegmentSink {
             inner: writer,

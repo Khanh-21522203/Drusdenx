@@ -1,7 +1,9 @@
-use chrono::{DateTime, Utc};
 use crate::core::error::{Error, ErrorKind, Result};
 use crate::core::types::FieldValue;
-use crate::query::ast::{BoolQuery, PhraseQuery, Query, RangeQuery, TermQuery, FuzzyQuery, WildcardQuery};
+use crate::query::ast::{
+    BoolQuery, FuzzyQuery, PhraseQuery, PrefixQuery, Query, RangeQuery, TermQuery, WildcardQuery,
+};
+use chrono::{DateTime, Utc};
 
 /// Query parser for converting string queries to AST
 #[derive(Clone)]
@@ -48,9 +50,7 @@ impl QueryParser {
         // Check for phrase query
         if input.starts_with('"') && input.ends_with('"') {
             let phrase = input.trim_matches('"');
-            let terms: Vec<String> = phrase.split_whitespace()
-                .map(String::from)
-                .collect();
+            let terms: Vec<String> = phrase.split_whitespace().map(String::from).collect();
             return Ok(Query::Phrase(PhraseQuery {
                 field: self.default_field.clone(),
                 phrase: terms,
@@ -74,6 +74,26 @@ impl QueryParser {
                 return self.parse_range_query(field, value);
             }
 
+            if self.allow_wildcards
+                && value.ends_with('*')
+                && !value[..value.len().saturating_sub(1)].contains('*')
+                && !value.contains('?')
+            {
+                return Ok(Query::Prefix(PrefixQuery {
+                    field: field.to_string(),
+                    prefix: value.trim_end_matches('*').to_string(),
+                    boost: None,
+                }));
+            }
+
+            if self.allow_wildcards && (value.contains('*') || value.contains('?')) {
+                return Ok(Query::Wildcard(WildcardQuery {
+                    field: field.to_string(),
+                    pattern: value.to_string(),
+                    boost: None,
+                }));
+            }
+
             return Ok(Query::Term(TermQuery {
                 field: field.to_string(),
                 value: value.to_string(),
@@ -87,7 +107,7 @@ impl QueryParser {
                 let term = &input[..pos];
                 let distance_str = &input[pos + 1..];
                 let distance = if distance_str.is_empty() {
-                    1  // Default distance
+                    1 // Default distance
                 } else {
                     distance_str.parse::<u8>().unwrap_or(2).min(2)
                 };
@@ -121,15 +141,15 @@ impl QueryParser {
     fn parse_boolean_query(&self, tokens: &[&str]) -> Result<Query> {
         let mut bool_query = BoolQuery::new();
         let mut current_op = self.default_operator;
-        let _current_term = String::new();
+        let mut pending_not = false;
 
         for token in tokens {
             match *token {
                 "AND" => current_op = BooleanOperator::And,
                 "OR" => current_op = BooleanOperator::Or,
                 "NOT" => {
-                    // Next term should be must_not
-                    current_op = BooleanOperator::And;
+                    // Mark the next term as must_not.
+                    pending_not = true;
                     continue;
                 }
                 _ => {
@@ -139,9 +159,14 @@ impl QueryParser {
                         boost: None,
                     });
 
-                    match current_op {
-                        BooleanOperator::And => bool_query.must.push(term_query),
-                        BooleanOperator::Or => bool_query.should.push(term_query),
+                    if pending_not {
+                        bool_query.must_not.push(term_query);
+                        pending_not = false;
+                    } else {
+                        match current_op {
+                            BooleanOperator::And => bool_query.must.push(term_query),
+                            BooleanOperator::Or => bool_query.should.push(term_query),
+                        }
                     }
                 }
             }
@@ -155,12 +180,16 @@ impl QueryParser {
         let inclusive_start = value.starts_with('[');
         let inclusive_end = value.ends_with(']');
 
-        let inner = value.trim_start_matches(|c| c == '[' || c == '{')
+        let inner = value
+            .trim_start_matches(|c| c == '[' || c == '{')
             .trim_end_matches(|c| c == ']' || c == '}');
 
         let parts: Vec<&str> = inner.split(" TO ").collect();
         if parts.len() != 2 {
-            return Err(Error::new(ErrorKind::Parse, "Invalid range query".to_string()));
+            return Err(Error::new(
+                ErrorKind::Parse,
+                "Invalid range query".to_string(),
+            ));
         }
 
         let mut range = RangeQuery {
@@ -197,6 +226,47 @@ impl QueryParser {
             FieldValue::Date(date.with_timezone(&Utc))
         } else {
             FieldValue::Text(s.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_boolean_not_populates_must_not() {
+        let parser = QueryParser::new();
+        let parsed = parser.parse("foo NOT bar").unwrap();
+
+        let Query::Bool(q) = parsed else {
+            panic!("expected bool query");
+        };
+
+        assert_eq!(q.should.len(), 1);
+        assert_eq!(q.must_not.len(), 1);
+
+        match &q.should[0] {
+            Query::Term(t) => assert_eq!(t.value, "foo"),
+            _ => panic!("expected term query in should"),
+        }
+        match &q.must_not[0] {
+            Query::Term(t) => assert_eq!(t.value, "bar"),
+            _ => panic!("expected term query in must_not"),
+        }
+    }
+
+    #[test]
+    fn parse_field_prefix_query() {
+        let parser = QueryParser::new();
+        let parsed = parser.parse("title:pre*").unwrap();
+
+        match parsed {
+            Query::Prefix(prefix) => {
+                assert_eq!(prefix.field, "title");
+                assert_eq!(prefix.prefix, "pre");
+            }
+            _ => panic!("expected prefix query"),
         }
     }
 }

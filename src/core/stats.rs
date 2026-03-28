@@ -1,6 +1,6 @@
-use std::time::SystemTime;
-use serde::{Serialize, Deserialize};
 use crate::query::cache::CacheStats;
+use serde::{Deserialize, Serialize};
+use std::time::SystemTime;
 
 /// Database statistics for monitoring
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,24 +8,25 @@ pub struct DatabaseStats {
     // General info
     pub uptime_secs: u64,
     pub start_time: SystemTime,
-    
+
     // Storage metrics
     pub segment_count: usize,
     pub total_documents: usize,
     pub deleted_documents: usize,
     pub index_size_bytes: u64,
     pub wal_size_bytes: u64,
-    
+
     // Memory metrics
     pub memory_pool_usage: MemoryStats,
     pub buffer_pool_usage: BufferStats,
     pub reader_pool_size: usize,
-    
+    pub reader_segment_open_failures: u64,
+
     // Query metrics
     pub cache_stats: CacheStats,
     pub queries_per_second: f64,
     pub avg_query_latency_ms: f64,
-    
+
     // Write metrics
     pub writes_per_second: f64,
     pub pending_writes: usize,

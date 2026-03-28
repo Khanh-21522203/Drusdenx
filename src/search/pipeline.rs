@@ -1,15 +1,15 @@
-use std::sync::Arc;
-use crate::core::error::Result;
+use crate::core::error::{Error, ErrorKind, Result};
 use crate::index::inverted::{InvertedIndex, Term};
 use crate::query::ast::{Query, TermQuery};
 use crate::query::matcher::{DocumentMatcher, SegmentSearch};
 use crate::query::optimizer::QueryOptimizer;
-use crate::query::planner::{QueryPlanner, LogicalPlan};
+use crate::query::planner::{LogicalPlan, QueryPlanner};
 use crate::query::types::{IndexStatistics, QueryValidator, ValidationConfig};
 use crate::reader::reader_pool::IndexReader;
 use crate::scoring::scorer::{BM25Scorer, DocStats, Scorer, ScoringContext};
-use crate::search::collector::{Collector, CollectDecision, IntoResults, MatchedDocument};
+use crate::search::collector::{CollectDecision, Collector, IntoResults, MatchedDocument};
 use crate::search::results::{ScoreExplanation, TopKCollector};
+use std::sync::Arc;
 
 /// Pipeline configuration (mirrors `ExecutionConfig` for the pipeline API).
 pub struct PipelineConfig {
@@ -48,88 +48,12 @@ where
 
 impl<S: Scorer, C: Collector + IntoResults> SearchPipeline<S, C> {
     pub fn execute(&mut self, reader: &IndexReader, query: &Query) -> Result<C::Output> {
-        // 1. Validate
-        if self.config.enable_validation {
-            let stats = IndexStatistics::from_index(&reader.index);
-            let validator = QueryValidator::new(self.validator_config.clone(), stats);
-            validator.validate(query)?;
-        }
-
-        // 2. Optimize
-        let optimized_query = if self.config.enable_optimization {
-            optimize_query(query, &reader.index, &self.optimizer)?
-        } else {
-            query.clone()
-        };
-
-        // 3. Execute on segments
-        let matcher = DocumentMatcher::new(reader.index.clone());
-        let stats = IndexStatistics::from_index(&reader.index);
-
-        'segments: for segment_reader in &reader.segments {
-            let seg = segment_reader.read();
-            let matches = seg.search(&optimized_query, &matcher)?;
-
-            for doc in matches {
-                // Skip deleted
-                if reader.deleted_docs.contains(doc.doc_id.0 as u32) {
-                    continue;
-                }
-
-                let score = calculate_score_with(
-                    doc.doc_id,
-                    &optimized_query,
-                    &reader.index,
-                    &self.scorer,
-                    &stats,
-                )?;
-
-                let explanation = if self.config.collect_explanations {
-                    Some(ScoreExplanation {
-                        value: score,
-                        description: format!("score for doc {}", doc.doc_id.0),
-                        details: Vec::new(),
-                    })
-                } else {
-                    None
-                };
-
-                let matched = MatchedDocument {
-                    doc_id: doc.doc_id,
-                    score,
-                    document: doc.document,
-                    explanation,
-                };
-
-                match self.collector.collect(matched) {
-                    CollectDecision::Continue => {}
-                    CollectDecision::Terminate => break 'segments,
-                }
-            }
-        }
-
-        self.collector.finish();
-
-        // We need to move the collector out to call into_results().
-        // Since we need &mut self, we use a trick: swap with a dummy.
-        // Instead, we take the results from a reference-based approach.
-        // Use std::mem::replace with a new collector of same type is not possible
-        // without Default. We work around this by reconstructing the results inline.
-        //
-        // The simplest solution: use a wrapper that allows consuming.
-        // Since we can't move out of &mut self, we delegate to a separate helper.
-        // This is a known limitation — see pipeline_helper below.
-        //
-        // For now: rebuild results from the heap directly via get_results().
-        // This is safe because we do NOT call collect() after this point.
-        unimplemented_collect_results()
+        let _ = (reader, query);
+        Err(Error::new(
+            ErrorKind::InvalidState,
+            "SearchPipeline::execute(&mut self, ...) is unavailable; use SearchPipeline::run(self, ...)".to_string(),
+        ))
     }
-}
-
-// This function cannot be implemented generically without consuming self.
-// Instead, we provide `execute_consuming` below.
-fn unimplemented_collect_results<T>() -> Result<T> {
-    unreachable!("Use SearchPipeline::run() instead of execute()")
 }
 
 impl<S: Scorer, C: Collector + IntoResults> SearchPipeline<S, C> {
@@ -255,22 +179,33 @@ fn optimize_query(
     index: &InvertedIndex,
     optimizer: &QueryOptimizer,
 ) -> Result<Query> {
+    if !is_safe_to_optimize(query) {
+        return Ok(query.clone());
+    }
+
     let stats = IndexStatistics::from_index(index);
     let planner = QueryPlanner::new(stats);
     let plan = planner.plan(query);
     let optimized_plan = optimizer.optimize(plan);
-    plan_to_query(optimized_plan)
+
+    match plan_to_query(optimized_plan) {
+        Ok(optimized_query) => Ok(optimized_query),
+        Err(_) => Ok(query.clone()),
+    }
 }
 
 fn plan_to_query(plan: LogicalPlan) -> Result<Query> {
     use crate::query::ast::BoolQuery;
     match plan {
-        LogicalPlan::IndexSeek { field, term } => {
-            Ok(Query::Term(TermQuery { field, value: term, boost: None }))
-        }
+        LogicalPlan::IndexSeek { field, term } => Ok(Query::Term(TermQuery {
+            field,
+            value: term,
+            boost: None,
+        })),
         LogicalPlan::Filter { predicate, .. } => Ok(predicate),
         LogicalPlan::Union { inputs } => {
-            let should = inputs.into_iter()
+            let should = inputs
+                .into_iter()
                 .map(plan_to_query)
                 .collect::<Result<Vec<_>>>()?;
             Ok(Query::Bool(BoolQuery {
@@ -283,7 +218,8 @@ fn plan_to_query(plan: LogicalPlan) -> Result<Query> {
             }))
         }
         LogicalPlan::Intersection { inputs } => {
-            let must = inputs.into_iter()
+            let must = inputs
+                .into_iter()
                 .map(plan_to_query)
                 .collect::<Result<Vec<_>>>()?;
             Ok(Query::Bool(BoolQuery {
@@ -309,7 +245,28 @@ fn plan_to_query(plan: LogicalPlan) -> Result<Query> {
         }
         LogicalPlan::Limit { input, .. } => plan_to_query(*input),
         LogicalPlan::Sort { input, .. } => plan_to_query(*input),
-        LogicalPlan::Scan { .. } => Ok(Query::MatchAll),
+        LogicalPlan::Scan { .. } => Err(Error::new(
+            ErrorKind::InvalidState,
+            "Cannot safely convert LogicalPlan::Scan back into a specific query".to_string(),
+        )),
+    }
+}
+
+fn is_safe_to_optimize(query: &Query) -> bool {
+    match query {
+        Query::Term(_) => true,
+        Query::Bool(bool_query) => {
+            bool_query.must_not.is_empty()
+                && bool_query.filter.is_empty()
+                && bool_query.must.iter().all(is_safe_to_optimize)
+                && bool_query.should.iter().all(is_safe_to_optimize)
+        }
+        Query::MatchAll => true,
+        Query::Phrase(_)
+        | Query::Range(_)
+        | Query::Prefix(_)
+        | Query::Wildcard(_)
+        | Query::Fuzzy(_) => false,
     }
 }
 
@@ -357,5 +314,42 @@ fn calculate_score_with<S: Scorer>(
             Ok(total * bq.boost.unwrap_or(1.0))
         }
         _ => Ok(1.0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mvcc::controller::Snapshot;
+    use roaring::RoaringBitmap;
+
+    #[test]
+    fn execute_returns_error_instead_of_panicking() {
+        let index = Arc::new(InvertedIndex::new());
+        let mut pipeline = PipelineBuilder::new(index.clone()).build_default(10);
+        let reader = IndexReader {
+            snapshot: Arc::new(Snapshot::default()),
+            segments: Vec::new(),
+            deleted_docs: Arc::new(RoaringBitmap::new()),
+            index,
+        };
+
+        let result = pipeline.execute(&reader, &Query::MatchAll);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn optimize_query_preserves_non_term_variants() {
+        let index = InvertedIndex::new();
+        let optimizer = QueryOptimizer::new();
+
+        let wildcard = Query::Wildcard(crate::query::ast::WildcardQuery {
+            field: "title".to_string(),
+            pattern: "pre*".to_string(),
+            boost: None,
+        });
+
+        let optimized = optimize_query(&wildcard, &index, &optimizer).unwrap();
+        assert!(matches!(optimized, Query::Wildcard(_)));
     }
 }

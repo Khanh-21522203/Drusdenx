@@ -1,8 +1,8 @@
+use crate::core::types::DocId;
 use chrono::{DateTime, Utc};
-use uuid::Uuid;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use crate::core::types::DocId;
+use uuid::Uuid;
 
 /// Unique segment identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -39,9 +39,9 @@ pub struct SegmentMetadata {
 /// Segment file header
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentHeader {
-    pub version: u32,     // Format version
-    pub doc_count: u32,   // Number of documents
-    pub checksum: u32,    // CRC32 checksum
+    pub version: u32,   // Format version
+    pub doc_count: u32, // Number of documents
+    pub checksum: u32,  // CRC32 checksum
     pub compression: CompressionType,
 }
 
@@ -50,6 +50,7 @@ pub enum CompressionType {
     None,
     Lz4,
     Zstd,
+    Snappy,
 }
 
 impl SegmentHeader {

@@ -1,13 +1,14 @@
-use std::sync::{Arc, Mutex};
-use crate::core::types::Document;
-use crate::storage::segment::SegmentId;
-use crate::storage::segment_writer::SegmentWriter;
-use crate::storage::wal::{Operation, WAL};
+use crate::compression::compress::CompressionType;
 use crate::core::error::Result;
+use crate::core::types::Document;
 use crate::memory::buffer_pool::BufferPool;
 use crate::storage::layout::StorageLayout;
 use crate::storage::segment::Segment;
+use crate::storage::segment::SegmentId;
+use crate::storage::segment_writer::SegmentWriter;
+use crate::storage::wal::{Operation, WAL};
 use std::mem;
+use std::sync::{Arc, Mutex};
 
 /// DataWriter handles WAL and data persistence
 pub struct DataWriter {
@@ -17,7 +18,7 @@ pub struct DataWriter {
     pub storage: Arc<StorageLayout>,
     pub buffer_pool: Arc<BufferPool>,
     pub batch_size: usize,
-    pub pending_docs: Vec<Document>,  // Batch buffer
+    pub pending_docs: Vec<Document>, // Batch buffer
 }
 
 impl DataWriter {
@@ -29,7 +30,8 @@ impl DataWriter {
         let segment_writer = SegmentWriter::new(
             &storage,
             SegmentId::new(),
-            buffer_pool.clone()
+            buffer_pool.clone(),
+            CompressionType::LZ4,
         )?;
 
         let wal = WAL::open(&storage, 0)?;
@@ -57,31 +59,31 @@ impl DataWriter {
 
         Ok(())
     }
-    
+
     /// Add document to batch (optimized for bulk writes)
     pub fn add_to_batch(&mut self, doc: Document) {
         self.pending_docs.push(doc);
     }
-    
+
     /// Flush batch - write all pending documents at once
     pub fn flush_batch(&mut self) -> Result<usize> {
         if self.pending_docs.is_empty() {
             return Ok(0);
         }
-        
+
         let _lock = self.lock.lock().unwrap();
         let count = self.pending_docs.len();
-        
+
         // Batch WAL writes
         for doc in &self.pending_docs {
             self.wal.append(Operation::AddDocument(doc.clone()))?;
         }
-        
+
         // Batch segment writes
         for doc in &self.pending_docs {
             self.segment_writer.write_document(doc)?;
         }
-        
+
         self.pending_docs.clear();
         Ok(count)
     }
@@ -99,7 +101,8 @@ impl DataWriter {
         let new_writer = SegmentWriter::new(
             &self.storage,
             SegmentId::new(),
-            self.buffer_pool.clone()
+            self.buffer_pool.clone(),
+            CompressionType::LZ4,
         )?;
 
         // Replace and finish old writer
