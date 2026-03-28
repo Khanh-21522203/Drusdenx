@@ -1,5 +1,7 @@
 use serde::{Serialize, Deserialize};
 use crate::core::types::FieldValue;
+use crate::core::error::Result;
+use crate::query::visitor::QueryVisitor;
 
 /// Main query enum representing all query types
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -76,6 +78,22 @@ pub struct FuzzyQuery {
     pub max_edits: Option<u8>,      // Default: 2 (Levenshtein distance)
     pub prefix_length: Option<u8>,  // Default: 0 (no prefix lock)
     pub boost: Option<f32>,
+}
+
+impl Query {
+    /// Single place where variant → method mapping lives.
+    pub fn accept<V: QueryVisitor>(&self, visitor: &V) -> Result<V::Output> {
+        match self {
+            Query::Term(q)     => visitor.visit_term(q),
+            Query::Phrase(q)   => visitor.visit_phrase(q),
+            Query::Bool(q)     => visitor.visit_bool(q),
+            Query::Range(q)    => visitor.visit_range(q),
+            Query::Prefix(q)   => visitor.visit_prefix(q),
+            Query::Wildcard(q) => visitor.visit_wildcard(q),
+            Query::Fuzzy(q)    => visitor.visit_fuzzy(q),
+            Query::MatchAll    => visitor.visit_match_all(),
+        }
+    }
 }
 
 impl BoolQuery {

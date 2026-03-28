@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.storage_path = std::path::PathBuf::from("./data");
     
     let schema = SchemaWithAnalyzer::new();
-    let mut db = Drusdenx::core::database::Database::open_with_schema(schema, config)?;
+    let db = Drusdenx::core::database::Database::open_with_schema(schema, config)?;
     
     // 2. Enable low memory mode with custom config
     let low_mem_config = LowMemoryConfig {

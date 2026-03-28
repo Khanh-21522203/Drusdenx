@@ -121,7 +121,7 @@ impl QueryParser {
     fn parse_boolean_query(&self, tokens: &[&str]) -> Result<Query> {
         let mut bool_query = BoolQuery::new();
         let mut current_op = self.default_operator;
-        let current_term = String::new();
+        let _current_term = String::new();
 
         for token in tokens {
             match *token {

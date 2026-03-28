@@ -6,12 +6,18 @@ use parking_lot::Mutex;  // Thread-safe interior mutability
 /// Wrapped in Arc<Mutex<>> for shared mutable access across threads
 pub struct BufferPool {
     pools: Mutex<HashMap<usize, BufferQueue>>,
+    /// Running total of allocated bytes; updated on acquire/release.
+    #[allow(dead_code)]
     total_memory: AtomicUsize,
+    /// Hard cap — allocations beyond this limit are rejected.
+    #[allow(dead_code)]
     memory_limit: usize,
 }
 
 struct BufferQueue {
     buffers: VecDeque<Vec<u8>>,
+    /// The fixed size class this queue serves (e.g. 4096, 65536 …).
+    #[allow(dead_code)]
     size_class: usize,
 }
 

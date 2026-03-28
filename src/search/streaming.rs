@@ -1,3 +1,7 @@
+//! Streaming search API — intended for future use (large result sets, ETL, pagination).
+//! All items here are intentionally kept for upcoming implementation work.
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use parking_lot::RwLock;
 use crate::core::types::Document;
@@ -12,10 +16,10 @@ use crate::core::error::Result;
 /// Use cases:
 /// - Export millions of documents
 /// - Large pagination (page 1000+)
-/// - Streaming API responses  
+/// - Streaming API responses
 /// - ETL pipelines
 /// - Analytics queries
-/// 
+///
 /// Required work:
 /// 1. Implement fetch_batch() with actual segment reading
 /// 2. Add search_with_offset() to SegmentReader
@@ -42,7 +46,7 @@ impl StreamingProcessor {
     pub fn process_streaming(
         &self,
         query: &Query,
-        reader: &mut LazySegmentReader
+        _reader: &mut LazySegmentReader
     ) -> Result<StreamingResults> {
         let cursor = StreamingCursor::new(query.clone(), self.batch_size);
 
@@ -105,7 +109,7 @@ impl StreamingResults {
         cursor.exhausted = false;
     }
 
-    fn fetch_batch(&self, cursor: &mut StreamingCursor) -> Result<Vec<Document>> {
+    fn fetch_batch(&self, _cursor: &mut StreamingCursor) -> Result<Vec<Document>> {
         // TODO: Implement actual batch fetching
         // 1. Get reader from pool
         // 2. Execute query with offset = cursor.position

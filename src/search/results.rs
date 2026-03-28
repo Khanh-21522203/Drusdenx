@@ -1,6 +1,7 @@
 use std::collections::BinaryHeap;
 use std::cmp::Ordering;
 use crate::core::types::{DocId, Document};
+use crate::search::collector::{Collector, CollectDecision, IntoResults, MatchedDocument};
 
 /// Search results container
 #[derive(Debug, Clone)]
@@ -91,5 +92,52 @@ impl TopKCollector {
 
     pub fn max_score(&self) -> f32 {
         self.heap.peek().map(|doc| doc.score).unwrap_or(0.0)
+    }
+}
+
+// Implement the new Collector trait for TopKCollector
+impl Collector for TopKCollector {
+    fn collect(&mut self, doc: MatchedDocument) -> CollectDecision {
+        let scored_doc = ScoredDocument {
+            doc_id: doc.doc_id,
+            score: doc.score,
+            document: doc.document,
+            explanation: doc.explanation,
+        };
+        self.total_collected += 1;
+
+        if scored_doc.score > self.min_score || self.heap.len() < self.k {
+            self.heap.push(scored_doc);
+
+            if self.heap.len() > self.k {
+                self.heap.pop();
+                if let Some(min_doc) = self.heap.peek() {
+                    self.min_score = min_doc.score;
+                }
+            }
+        }
+
+        CollectDecision::Continue
+    }
+}
+
+impl IntoResults for TopKCollector {
+    type Output = SearchResults;
+
+    fn into_results(self) -> SearchResults {
+        let total_hits = self.total_collected;
+        let max_score = self.heap.peek().map(|d| d.score).unwrap_or(0.0);
+        let hits = {
+            let mut results: Vec<_> = self.heap.into_iter().collect();
+            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            results
+        };
+
+        SearchResults {
+            hits,
+            total_hits,
+            max_score,
+            took_ms: 0,
+        }
     }
 }

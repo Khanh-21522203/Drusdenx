@@ -48,19 +48,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Simple search
     match db.search("rust") {
         Ok(results) => println!("  'rust': {} results", results.len()),
-        Err(_) => println!("  'rust': 0 results"),
+        Err(_) => println!("  'rust': 0 results (no match)"),
     }
-    
+
     // Field-specific search
     match db.search("title:Database") {
         Ok(results) => println!("  'title:Database': {} results", results.len()),
-        Err(_) => println!("  'title:Database': 0 results"),
+        Err(_) => println!("  'title:Database': 0 results (no match)"),
     }
-    
+
     // Boolean search
     match db.search("rust AND programming") {
         Ok(results) => println!("  'rust AND programming': {} results", results.len()),
-        Err(_) => println!("  'rust AND programming': 0 results"),
+        Err(_) => println!("  'rust AND programming': 0 results (no match)"),
     }
     println!();
 

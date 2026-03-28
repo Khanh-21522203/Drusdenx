@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use crate::core::error::{Error, ErrorKind, Result};
 use crate::index::inverted::InvertedIndex;
-use crate::query::ast::Query;
+use crate::query::ast::{Query, TermQuery, PhraseQuery, BoolQuery, RangeQuery, PrefixQuery, WildcardQuery, FuzzyQuery};
 use crate::query::planner::LogicalPlan;
+use crate::query::visitor::QueryVisitor;
 
 /// Sort order for query results
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -126,9 +127,11 @@ impl Default for ValidationConfig {
     }
 }
 
-/// Query validator
+/// Query validator — now implements QueryVisitor for compile-enforced exhaustiveness
 pub struct QueryValidator {
     config: ValidationConfig,
+    /// Reserved for future statistics-based validation rules (e.g., cardinality limits).
+    #[allow(dead_code)]
     statistics: IndexStatistics,
 }
 
@@ -139,12 +142,12 @@ impl QueryValidator {
 
     /// Validate query structure and constraints
     pub fn validate(&self, query: &Query) -> Result<()> {
-        self.validate_depth(query, 0)?;
-        self.validate_bool_clauses(query)?;
+        self.validate_depth_recursive(query, 0)?;
+        query.accept(self)?;
         Ok(())
     }
 
-    fn validate_depth(&self, query: &Query, depth: usize) -> Result<()> {
+    fn validate_depth_recursive(&self, query: &Query, depth: usize) -> Result<()> {
         if depth > self.config.max_query_depth {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
@@ -153,38 +156,69 @@ impl QueryValidator {
             ));
         }
 
-        match query {
-            Query::Bool(bool_query) => {
-                for q in &bool_query.must {
-                    self.validate_depth(q, depth + 1)?;
-                }
-                for q in &bool_query.should {
-                    self.validate_depth(q, depth + 1)?;
-                }
-                for q in &bool_query.must_not {
-                    self.validate_depth(q, depth + 1)?;
-                }
+        if let Query::Bool(bool_query) = query {
+            for q in &bool_query.must {
+                self.validate_depth_recursive(q, depth + 1)?;
             }
-            _ => {}
+            for q in &bool_query.should {
+                self.validate_depth_recursive(q, depth + 1)?;
+            }
+            for q in &bool_query.must_not {
+                self.validate_depth_recursive(q, depth + 1)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl QueryVisitor for QueryValidator {
+    type Output = ();
+
+    fn visit_term(&self, _q: &TermQuery) -> Result<()> {
+        Ok(())
+    }
+
+    fn visit_phrase(&self, _q: &PhraseQuery) -> Result<()> {
+        Ok(())
+    }
+
+    fn visit_bool(&self, q: &BoolQuery) -> Result<()> {
+        let total_clauses = q.must.len() + q.should.len() + q.must_not.len();
+
+        if total_clauses > self.config.max_bool_clauses {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("Boolean query has {} clauses, max is {}",
+                        total_clauses, self.config.max_bool_clauses)
+            ));
+        }
+
+        // Recurse into sub-queries
+        for clause in q.must.iter().chain(q.should.iter()).chain(q.must_not.iter()) {
+            clause.accept(self)?;
         }
 
         Ok(())
     }
 
-    fn validate_bool_clauses(&self, query: &Query) -> Result<()> {
-        if let Query::Bool(bool_query) = query {
-            let total_clauses = bool_query.must.len()
-                + bool_query.should.len()
-                + bool_query.must_not.len();
+    fn visit_range(&self, _q: &RangeQuery) -> Result<()> {
+        Ok(())
+    }
 
-            if total_clauses > self.config.max_bool_clauses {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    format!("Boolean query has {} clauses, max is {}",
-                            total_clauses, self.config.max_bool_clauses)
-                ));
-            }
-        }
+    fn visit_prefix(&self, _q: &PrefixQuery) -> Result<()> {
+        Ok(())
+    }
+
+    fn visit_wildcard(&self, _q: &WildcardQuery) -> Result<()> {
+        Ok(())
+    }
+
+    fn visit_fuzzy(&self, _q: &FuzzyQuery) -> Result<()> {
+        Ok(())
+    }
+
+    fn visit_match_all(&self) -> Result<()> {
         Ok(())
     }
 }

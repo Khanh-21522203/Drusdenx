@@ -1,5 +1,7 @@
-use crate::query::ast::Query;
+use crate::query::ast::{Query, TermQuery, PhraseQuery, BoolQuery, RangeQuery, PrefixQuery, WildcardQuery, FuzzyQuery};
 use crate::query::types::{IndexStatistics, SortOrder};
+use crate::query::visitor::QueryVisitor;
+use crate::core::error::Result;
 
 /// Query planner creates execution plans
 pub struct QueryPlanner {
@@ -13,47 +15,77 @@ impl QueryPlanner {
 
     /// Create execution plan from query
     pub fn plan(&self, query: &Query) -> LogicalPlan {
-        match query {
-            Query::Term(term_query) => {
-                LogicalPlan::IndexSeek {
-                    field: term_query.field.clone(),
-                    term: term_query.value.clone(),
-                }
-            }
-            Query::Bool(bool_query) => {
-                if !bool_query.must.is_empty() {
-                    // Must clause: intersection
-                    let inputs = bool_query.must
-                        .iter()
-                        .map(|q| self.plan(q))
-                        .collect();
-                    LogicalPlan::Intersection { inputs }
-                } else if !bool_query.should.is_empty() {
-                    // Should clause: union
-                    let inputs = bool_query.should
-                        .iter()
-                        .map(|q| self.plan(q))
-                        .collect();
-                    LogicalPlan::Union { inputs }
-                } else {
-                    // Default: scan all
-                    LogicalPlan::Scan {
-                        field: "content".to_string(),
-                    }
-                }
-            }
-            Query::MatchAll => {
-                LogicalPlan::Scan {
-                    field: "content".to_string(),
-                }
-            }
-            _ => {
-                // Default plan
-                LogicalPlan::Scan {
-                    field: "content".to_string(),
-                }
-            }
+        // Use accept() for dispatch; fall back to scan on error
+        query.accept(self).unwrap_or_else(|_| LogicalPlan::Scan {
+            field: "content".to_string(),
+        })
+    }
+}
+
+impl QueryVisitor for QueryPlanner {
+    type Output = LogicalPlan;
+
+    fn visit_term(&self, q: &TermQuery) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::IndexSeek {
+            field: q.field.clone(),
+            term: q.value.clone(),
+        })
+    }
+
+    fn visit_phrase(&self, _q: &PhraseQuery) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Scan {
+            field: "content".to_string(),
+        })
+    }
+
+    fn visit_bool(&self, q: &BoolQuery) -> Result<LogicalPlan> {
+        if !q.must.is_empty() {
+            let inputs = q.must
+                .iter()
+                .map(|query| query.accept(self))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(LogicalPlan::Intersection { inputs })
+        } else if !q.should.is_empty() {
+            let inputs = q.should
+                .iter()
+                .map(|query| query.accept(self))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(LogicalPlan::Union { inputs })
+        } else {
+            Ok(LogicalPlan::Scan {
+                field: "content".to_string(),
+            })
         }
+    }
+
+    fn visit_range(&self, _q: &RangeQuery) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Scan {
+            field: "content".to_string(),
+        })
+    }
+
+    fn visit_prefix(&self, _q: &PrefixQuery) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Scan {
+            field: "content".to_string(),
+        })
+    }
+
+    fn visit_wildcard(&self, _q: &WildcardQuery) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Scan {
+            field: "content".to_string(),
+        })
+    }
+
+    fn visit_fuzzy(&self, _q: &FuzzyQuery) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Scan {
+            field: "content".to_string(),
+        })
+    }
+
+    fn visit_match_all(&self) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Scan {
+            field: "content".to_string(),
+        })
     }
 }
 

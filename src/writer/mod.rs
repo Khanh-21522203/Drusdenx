@@ -2,3 +2,8 @@ pub mod index_writer;
 pub mod data_writer;
 pub mod parallel_writer;
 pub mod batch;
+pub mod wal_backend;
+pub mod segment_store;
+pub mod disk_wal;
+pub mod session;
+pub mod builder;

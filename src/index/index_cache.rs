@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use parking_lot::RwLock as ParkingLotRwLock;
 use crate::index::index_reader::IndexReader;
 use crate::storage::segment::SegmentId;

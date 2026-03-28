@@ -23,6 +23,7 @@ pub struct LazyIndexReader {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct TermOffset {
     offset: u64,
     length: u64,

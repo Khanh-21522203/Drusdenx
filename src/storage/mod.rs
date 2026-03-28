@@ -6,3 +6,5 @@ pub mod segment_writer;
 pub mod segment_reader;
 pub mod checkpoint;
 pub mod merge_policy;
+pub mod disk_segment_opener;
+pub mod disk_segment_store;

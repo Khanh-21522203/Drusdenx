@@ -108,12 +108,12 @@ impl LazySegmentReader {
         }
     }
 
-    fn find_in_dictionary(&self, dict_data: &[u8], term: &Term) -> Option<u64> {
+    fn find_in_dictionary(&self, _dict_data: &[u8], _term: &Term) -> Option<u64> {
         // Binary search implementation
         None // Placeholder
     }
 
-    fn read_posting_at(&self, offset: u64, data: &[u8]) -> Result<PostingList> {
+    fn read_posting_at(&self, _offset: u64, _data: &[u8]) -> Result<PostingList> {
         // Deserialize posting list
         // Return empty PostingList for now
         Ok(PostingList::new(Vec::new())?)

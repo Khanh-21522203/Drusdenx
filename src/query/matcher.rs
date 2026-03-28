@@ -2,12 +2,13 @@ use std::sync::Arc;
 use regex::Regex;
 use crate::core::types::{Document, FieldValue};
 use crate::query::ast::{Query, TermQuery, PhraseQuery, BoolQuery, RangeQuery, PrefixQuery, FuzzyQuery, WildcardQuery};
-use crate::core::error::{Result, Error, ErrorKind};
+use crate::core::error::Result;
 use crate::core::utils::levenshtein_distance;
 use crate::index::inverted::{InvertedIndex, Term};
 use crate::search::results::ScoredDocument;
 use crate::storage::segment_reader::SegmentReader;
 use crate::storage::segment::SegmentHeader;
+use crate::query::visitor::QueryVisitor;
 
 /// Document matcher - implements query matching logic
 /// This is the search functionality that M02 didn't have
@@ -16,59 +17,40 @@ pub struct DocumentMatcher {
     index: Arc<InvertedIndex>,
 }
 
-impl DocumentMatcher {
-    pub fn new(index: Arc<InvertedIndex>) -> Self {
-        DocumentMatcher { index }
-    }
+/// Thin per-call context. Stack-allocated. Carries doc reference without
+/// polluting visitor method signatures for variants that don't need it.
+struct MatchContext<'a> {
+    matcher: &'a DocumentMatcher,
+    doc: &'a Document,
+}
 
-    /// Check if document matches query
-    /// This replaces the search() method that was removed from M02
-    pub fn matches(&self, doc: &Document, query: &Query) -> Result<bool> {
-        match query {
-            Query::MatchAll => Ok(true),
-            Query::Term(term_query) => self.matches_term(doc, term_query),
-            Query::Phrase(phrase_query) => self.matches_phrase(doc, phrase_query),
-            Query::Bool(bool_query) => self.matches_bool(doc, bool_query),
-            Query::Range(range_query) => self.matches_range(doc, range_query),
-            Query::Prefix(prefix_query) => self.matches_prefix(doc, prefix_query),
-            Query::Wildcard(wildcard_query) => self.matches_wildcard(doc, wildcard_query),
-            Query::Fuzzy(fuzzy_query) => self.matches_fuzzy(doc, fuzzy_query),
-        }
-    }
-    /// Match term query - field-specific search
-    fn matches_term(&self, doc: &Document, term_query: &TermQuery) -> Result<bool> {
-        let field = &term_query.field;
-        let value = &term_query.value;
+impl QueryVisitor for MatchContext<'_> {
+    type Output = bool;
 
-        // Special field "_all" searches all text fields
-        if field == "_all" {
-            return Ok(self.doc_contains_text(doc, value));
+    fn visit_term(&self, q: &TermQuery) -> Result<bool> {
+        let value = &q.value;
+
+        if q.field == "_all" {
+            return Ok(self.matcher.doc_contains_text(self.doc, value));
         }
 
-        // Field-specific search
-        Ok(self.field_contains_text(doc, field, value))
+        Ok(self.matcher.field_contains_text(self.doc, &q.field, value))
     }
 
-    /// Match phrase query - proximity search with slop
-    fn matches_phrase(&self, doc: &Document, phrase_query: &PhraseQuery) -> Result<bool> {
-        let field = &phrase_query.field;
-        let phrase = &phrase_query.phrase;
-        let slop = phrase_query.slop;
+    fn visit_phrase(&self, q: &PhraseQuery) -> Result<bool> {
+        let _field = &q.field;
+        let phrase = &q.phrase;
+        let slop = q.slop;
 
-        // Get term positions from inverted index (M04)
-        // InvertedIndex stores positions for each term in each document
         let mut term_positions: Vec<Vec<u32>> = Vec::new();
 
         for term_text in phrase {
-            // Create Term from text
             let term = Term::new(term_text);
 
-            // Query index for posting list of this term
-            if let Some(posting_list) = self.index.search_term(&term) {
-                // Find posting for this specific document
+            if let Some(posting_list) = self.matcher.index.search_term(&term) {
                 let mut found = false;
                 for posting in &posting_list.iter()? {
-                    if posting.doc_id == doc.id {
+                    if posting.doc_id == self.doc.id {
                         term_positions.push(posting.positions.clone());
                         found = true;
                         break;
@@ -76,48 +58,40 @@ impl DocumentMatcher {
                 }
 
                 if !found {
-                    // Term not found in this document
                     return Ok(false);
                 }
             } else {
-                // Term not in index at all
                 return Ok(false);
             }
         }
 
-        // Check if positions satisfy phrase constraint
         if slop == 0 {
-            // Exact phrase: terms must be adjacent
-            // E.g., "hello world" requires pos(world) == pos(hello) + 1
-            Ok(self.check_adjacent_positions(&term_positions))
+            Ok(self.matcher.check_adjacent_positions(&term_positions))
         } else {
-            // Proximity match: allow gaps up to slop
-            // E.g., "hello world"~2 allows up to 2 words between hello and world
-            Ok(self.check_proximity_positions(&term_positions, slop))
+            Ok(self.matcher.check_proximity_positions(&term_positions, slop))
         }
     }
 
-    /// Match boolean query
-    fn matches_bool(&self, doc: &Document, bool_query: &BoolQuery) -> Result<bool> {
+    fn visit_bool(&self, q: &BoolQuery) -> Result<bool> {
         // Must clauses: all must match (AND)
-        for must_clause in &bool_query.must {
-            if !self.matches(doc, must_clause)? {
+        for must_clause in &q.must {
+            if !must_clause.accept(self)? {
                 return Ok(false);
             }
         }
 
         // Must not clauses: none must match (NOT)
-        for must_not_clause in &bool_query.must_not {
-            if self.matches(doc, must_not_clause)? {
+        for must_not_clause in &q.must_not {
+            if must_not_clause.accept(self)? {
                 return Ok(false);
             }
         }
 
         // Should clauses: at least one must match (OR)
-        if !bool_query.should.is_empty() {
+        if !q.should.is_empty() {
             let mut any_match = false;
-            for should_clause in &bool_query.should {
-                if self.matches(doc, should_clause)? {
+            for should_clause in &q.should {
+                if should_clause.accept(self)? {
                     any_match = true;
                     break;
                 }
@@ -128,8 +102,8 @@ impl DocumentMatcher {
         }
 
         // Filter clauses: must match but don't affect score
-        for filter_clause in &bool_query.filter {
-            if !self.matches(doc, filter_clause)? {
+        for filter_clause in &q.filter {
+            if !filter_clause.accept(self)? {
                 return Ok(false);
             }
         }
@@ -137,17 +111,14 @@ impl DocumentMatcher {
         Ok(true)
     }
 
-    /// Match range query
-    fn matches_range(&self, doc: &Document, range_query: &RangeQuery) -> Result<bool> {
-        if let Some(field_value) = doc.fields.get(&range_query.field) {
+    fn visit_range(&self, q: &RangeQuery) -> Result<bool> {
+        if let Some(field_value) = self.doc.fields.get(&q.field) {
             match field_value {
                 FieldValue::Number(num) => {
-                    Ok(self.number_in_range(*num, range_query))
+                    Ok(self.matcher.number_in_range(*num, q))
                 },
-                FieldValue::Date(date) => {
-                    // Date range matching
-                    // Implementation depends on range_query having date values
-                    Ok(true)  // Placeholder
+                FieldValue::Date(_date) => {
+                    Ok(true) // Placeholder
                 },
                 _ => Ok(false),
             }
@@ -156,15 +127,13 @@ impl DocumentMatcher {
         }
     }
 
-    fn matches_prefix(&self, doc: &Document, query: &PrefixQuery) -> Result<bool> {
-        if let Some(field_value) = doc.fields.get(&query.field) {
+    fn visit_prefix(&self, q: &PrefixQuery) -> Result<bool> {
+        if let Some(field_value) = self.doc.fields.get(&q.field) {
             match field_value {
                 FieldValue::Text(text) => {
-                    // Check if text starts with prefix
-                    // For multi-word fields, check if any word starts with prefix
                     let words: Vec<&str> = text.split_whitespace().collect();
                     for word in words {
-                        if word.starts_with(&query.prefix) {
+                        if word.starts_with(&q.prefix) {
                             return Ok(true);
                         }
                     }
@@ -175,14 +144,11 @@ impl DocumentMatcher {
         Ok(false)
     }
 
-    fn matches_wildcard(&self, doc: &Document, query: &WildcardQuery) -> Result<bool> {
-        // Get field value from document
-        if let Some(field_value) = doc.fields.get(&query.field) {
+    fn visit_wildcard(&self, q: &WildcardQuery) -> Result<bool> {
+        if let Some(field_value) = self.doc.fields.get(&q.field) {
             match field_value {
                 FieldValue::Text(text) => {
-                    // Convert wildcard pattern to regex
-                    // * -> .*, ? -> .
-                    let pattern = query.pattern
+                    let pattern = q.pattern
                         .replace("*", ".*")
                         .replace("?", ".");
 
@@ -196,34 +162,28 @@ impl DocumentMatcher {
         Ok(false)
     }
 
-    fn matches_fuzzy(&self, doc: &Document, query: &FuzzyQuery) -> Result<bool> {
-        // Get field value from document
-        if let Some(field_value) = doc.fields.get(&query.field) {
+    fn visit_fuzzy(&self, q: &FuzzyQuery) -> Result<bool> {
+        if let Some(field_value) = self.doc.fields.get(&q.field) {
             match field_value {
                 FieldValue::Text(text) => {
-                    let max_edits = query.max_edits.unwrap_or(2) as usize;
-                    let query_term_lower = query.term.to_lowercase();
-                    
-                    // FIX: Tokenize text into words and compare each word
-                    // Instead of comparing entire field text (wrong!)
+                    let max_edits = q.max_edits.unwrap_or(2) as usize;
+                    let query_term_lower = q.term.to_lowercase();
+
                     let words: Vec<&str> = text
                         .split_whitespace()
                         .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
                         .filter(|w| !w.is_empty())
                         .collect();
-                    
-                    // Compare query term with EACH word
+
                     for word in words {
                         let word_lower = word.to_lowercase();
                         let distance = levenshtein_distance(&query_term_lower, &word_lower);
-                        
-                        // Match if ANY word has distance <= max_edits
+
                         if distance <= max_edits {
                             return Ok(true);
                         }
                     }
-                    
-                    // No word matches
+
                     Ok(false)
                 }
                 _ => Ok(false),
@@ -233,14 +193,28 @@ impl DocumentMatcher {
         }
     }
 
+    fn visit_match_all(&self) -> Result<bool> {
+        Ok(true)
+    }
+}
+
+impl DocumentMatcher {
+    pub fn new(index: Arc<InvertedIndex>) -> Self {
+        DocumentMatcher { index }
+    }
+
+    /// The public interface collapses to a one-liner.
+    pub fn matches(&self, doc: &Document, query: &Query) -> Result<bool> {
+        let ctx = MatchContext { matcher: self, doc };
+        query.accept(&ctx)
+    }
+
     /// Check if term positions are adjacent (exact phrase match)
     fn check_adjacent_positions(&self, term_positions: &[Vec<u32>]) -> bool {
         if term_positions.is_empty() {
             return false;
         }
 
-        // Try all combinations of positions
-        // For "hello world", check if any pos(hello) + 1 == pos(world)
         for start_pos in &term_positions[0] {
             let mut current_pos = *start_pos;
             let mut found = true;
@@ -267,14 +241,11 @@ impl DocumentMatcher {
             return false;
         }
 
-        // Try all combinations of positions
-        // For "hello world"~2, allow distance <= 2 between terms
         for start_pos in &term_positions[0] {
             let mut current_pos = *start_pos;
             let mut found = true;
 
             for positions in &term_positions[1..] {
-                // Find nearest position within slop distance
                 let min_pos = current_pos + 1;
                 let max_pos = current_pos + slop + 1;
 
@@ -297,7 +268,6 @@ impl DocumentMatcher {
     }
 
     fn number_in_range(&self, num: f64, range_query: &RangeQuery) -> bool {
-        // Check gt/gte
         if let Some(FieldValue::Number(gt)) = &range_query.gt {
             if num <= *gt {
                 return false;
@@ -309,7 +279,6 @@ impl DocumentMatcher {
             }
         }
 
-        // Check lt/lte
         if let Some(FieldValue::Number(lt)) = &range_query.lt {
             if num >= *lt {
                 return false;
@@ -362,18 +331,17 @@ impl SegmentSearch for SegmentReader {
         use std::io::{Read, Seek, SeekFrom};
         use crate::compression::compress::CompressedBlock;
         let mut results = Vec::new();
-        
+
         // Use lazy iteration pattern directly here
         let mut file = self.file.lock().unwrap();
-        
+
         // Seek to start of documents (read header size to skip it)
-        // The file was positioned after header during open(), but we need to reposition
         file.seek(SeekFrom::Start(0))?;
         // Skip header by deserializing it (variable length)
         let _: SegmentHeader = bincode::deserialize_from(&mut *file)?;
-        
+
         // Now positioned right after header, ready to read documents
-        
+
         // Iterate through documents one by one
         for _ in 0..self.header.doc_count {
             // Read document length (serialized CompressedBlock size)
@@ -382,18 +350,18 @@ impl SegmentSearch for SegmentReader {
                 break; // EOF
             }
             let len = u32::from_le_bytes(len_buf) as usize;
-            
+
             // Read serialized CompressedBlock
             let mut block_buf = vec![0u8; len];
             file.read_exact(&mut block_buf)?;
-            
+
             // Deserialize CompressedBlock (includes original_size metadata)
             let compressed_block: CompressedBlock = bincode::deserialize(&block_buf)?;
             let decompressed = compressed_block.decompress()?;
-            
+
             // Deserialize document
             let doc: Document = bincode::deserialize(&decompressed)?;
-            
+
             // Apply query matching
             if matcher.matches(&doc, query)? {
                 results.push(ScoredDocument {

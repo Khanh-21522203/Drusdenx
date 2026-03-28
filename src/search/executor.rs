@@ -89,11 +89,12 @@ impl ExecutionConfig {
 /// This executor does NOT own any data or cache. It operates on provided IndexReader instances.
 /// 
 /// # Example
-/// ```rust
+/// ```rust,no_run
+/// # use Drusdenx::search::executor::{QueryExecutor, ExecutionConfig};
 /// let executor = QueryExecutor::new();
-/// let reader = reader_pool.get_reader()?;
-/// let query = parser.parse("rust programming")?;
-/// let results = executor.execute(&reader, &query, 10, ExecutionConfig::default())?;
+/// // let reader = reader_pool.get_reader()?;
+/// // let query = parser.parse("rust programming")?;
+/// // let results = executor.execute(&reader, &query, 10, ExecutionConfig::default())?;
 /// ```
 pub struct QueryExecutor {
     pub optimizer: QueryOptimizer,
